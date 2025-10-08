@@ -166,10 +166,10 @@ def _policy_filter(df: pd.DataFrame, verbose: bool = False) -> Tuple[pd.DataFram
     """Apply bank policy filters and report drops.
     Drops rows where:
       - page == 'landing'
-      - selected_agent is NaN
-      - model is NaN
+      - selected_agent is NaN or in {"", "nan", "none", "null"} (case-insensitive)
+      - model is NaN or in {"", "nan", "none", "null"} (case-insensitive)
     """
-    stats = {}
+    stats: Dict[str, int] = {}
     n0 = len(df)
 
     # page != landing
@@ -177,13 +177,18 @@ def _policy_filter(df: pd.DataFrame, verbose: bool = False) -> Tuple[pd.DataFram
     stats["dropped_landing"] = int(mask.sum())
     df = df.loc[~mask]
 
-    # drop NaN selected_agent
-    mask = df["selected_agent"].isna()
+    # helper to detect empty-like strings
+    def _empty_like(s: pd.Series) -> pd.Series:
+        s_str = s.astype(str).str.strip().str.lower()
+        return s.isna() | s_str.isin(["", "nan", "none", "null"])
+
+    # drop invalid selected_agent
+    mask = _empty_like(df["selected_agent"])  # catches NaN and string placeholders
     stats["dropped_selected_agent_nan"] = int(mask.sum())
     df = df.loc[~mask]
 
-    # drop NaN model
-    mask = df["model"].isna()
+    # drop invalid model
+    mask = _empty_like(df["model"])  # catches NaN and string placeholders
     stats["dropped_model_nan"] = int(mask.sum())
     df = df.loc[~mask]
 
@@ -410,10 +415,12 @@ def _load_all_csvs(logs_dir: Path, verbose: bool = False) -> Tuple[pd.DataFrame,
 def _prepare_dataframe(df: pd.DataFrame, decay: float, verbose: bool = False) -> Tuple[pd.DataFrame, Dict[str, int]]:
     df = df.copy()
     df["timestamp"] = _parse_timestamp_col(df)
-    df = _standardize_strings(df)
 
-    # Apply filters
+    # Apply filters BEFORE converting to strings to avoid turning NaN into literal 'nan'
     df, drop_stats = _policy_filter(df, verbose=verbose)
+
+    # Standardize strings (now that rows are valid)
+    df = _standardize_strings(df)
 
     # Remove rows with invalid timestamp after filtering (rare)
     invalid_ts = df["timestamp"].isna()
@@ -439,39 +446,49 @@ def _compute_leaderboard(
     verbose: bool = False,
 ) -> pd.DataFrame:
     metrics = _aggregate_agent_metrics(df, session_gap_mins=session_gap_mins, verbose=verbose)
+
+    # Drop invalid/placeholder agent IDs that may still remain
+    invalid_idx = (
+        metrics.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
+    )
+    metrics = metrics.loc[~invalid_idx]
+
     scored = _score_agents(metrics, alpha=alpha)
     ranked = scored.sort_values("score", ascending=False)
     ranked = _maybe_enrich_with_registry(ranked, bucket=bucket, user_email=user_email, verbose=verbose)
+
+    # Final guard: drop any rows whose index (agent_id) is empty/None/NaN-like
+    final_invalid = ranked.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
+    ranked = ranked.loc[~final_invalid]
+
     return ranked.head(topk)
 
 
 def _emit_json(df_ranked: pd.DataFrame, out_path: Path, include_model: Optional[str] = None) -> None:
-    cols = [
-        "agent_name",  # enriched or fallback to id
-        "owner_email",
-        "messages",
-        "unique_users",
-        "hhi",
-        "diversity",
-        "score",
-    ]
-
-    # Ensure index (agent_id) is preserved
+    """Emit JSON with only the requested fields:
+    ["agent_name", "messages", "unique_users", "hhi", "diversity", "score"].
+    Also drops any rows with invalid/placeholder agent IDs.
+    """
+    # Ensure agent_name exists; fallback to index
     out_df = df_ranked.copy()
-    out_df.insert(0, "agent_id", out_df.index.astype(str))
-    if include_model is not None:
-        out_df.insert(1, "model", include_model)
+    if "agent_name" not in out_df.columns:
+        out_df["agent_name"] = out_df.index.astype(str)
 
-    # Reorder columns if present
-    final_cols = [c for c in ["agent_id", "agent_name", "owner_email", "model", "messages", "unique_users", "hhi", "diversity", "score"] if c in out_df.columns]
+    # Filter out invalid agent ids
+    valid_idx = ~out_df.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
+    out_df = out_df.loc[valid_idx]
 
-    records = [
-        {
-            k: (None if (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else v)
-            for k, v in row.items()
-        }
-        for row in out_df[final_cols].to_dict(orient="records")
-    ]
+    final_cols = ["agent_name", "messages", "unique_users", "hhi", "diversity", "score"]
+
+    # Build records
+    records = []
+    for _, row in out_df.iterrows():
+        rec = {col: row[col] for col in final_cols if col in out_df.columns}
+        # normalize NaN/inf to None where applicable
+        for k, v in list(rec.items()):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                rec[k] = None
+        records.append(rec)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
