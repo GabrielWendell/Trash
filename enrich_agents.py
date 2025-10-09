@@ -466,19 +466,16 @@ def main() -> None:
 
     # 4) Score computation scope
     if args.score_scope == "per-folder":
-        # Compute score separately for each visibility
+        # Compute score separately for each visibility (but do NOT add a duplicate 'visibility' column here)
         df_scores_list = []
         for vis, sub_ids in df_agents.groupby("visibility")["id"]:
             sub_metrics = df_metrics.loc[sub_ids.values]
             sub_scores = score_agents(sub_metrics, alpha=args.alpha)
-            sub_scores["visibility"] = vis
             df_scores_list.append(sub_scores)
         df_scores = pd.concat(df_scores_list, axis=0)
     else:
         # Global scoring across all selected visibilities
         df_scores = score_agents(df_metrics, alpha=args.alpha)
-        # add temporary visibility for join convenience
-        df_scores = df_scores.join(df_agents.set_index("id")["visibility"], how="left")
 
     # 5) Join back static fields from YAML and dominant model, create final rows
     df_join = df_agents.set_index("id").join(df_scores, how="left")
