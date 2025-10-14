@@ -235,7 +235,7 @@ def main() -> None:
 
     # Optionally accumulate for global scoring
     global_metrics_frames = []
-    per_group_outputs: List[Tuple[str, pd.DataFrame, pd.DataFrame]] = []  # (group_id, DF_AG, DF_METR)
+    per_group_outputs: List[Tuple[str, pd.DataFrame, pd.DataFrame, str, List[str]]] = []  # (group_id, DF_AG, DF_METR, owner, members)
 
     for group_dir in sorted([d for d in groups_root.iterdir() if d.is_dir()]):
         group_id = group_dir.name
@@ -290,6 +290,8 @@ if DF_AG.empty:
     # minimal diagnostics line
     diag = {"group_id": group_id, "n_agents": 0}
     diagnostics_path = Path(args.out_dir) / "groups_enriched_diagnostics.jsonl"
+    # ensure diagnostics file exists
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     with open(diagnostics_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(diag, ensure_ascii=False) + "
 ")
