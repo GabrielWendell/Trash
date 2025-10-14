@@ -259,70 +259,97 @@ def main() -> None:
         owner = normalize_email(G.get("owner", ""))
 
         # Build agent table from YAMLs
-        rows = []
-        if group_agents_dir.exists():
-            for yml in sorted(group_agents_dir.glob("*.yaml")):
-                Y = safe_read_yaml(yml)
-                ag_id = (Y.get("agent_id") or Y.get("id") or Y.get("id_agente") or yml.stem).strip()
-                ag_nm = (Y.get("agent_name") or Y.get("nome_agente") or Y.get("name") or "").strip()
-                pr    = str(Y.get("prompt", ""))
-                tmp   = Y.get("temp", Y.get("temperature", None))
-                try:
-                    tmp = float(tmp) if tmp is not None else None
-                except Exception:
-                    tmp = None
-                rows.append({"id": ag_id, "name": normalize_name(ag_nm), "prompt": pr, "temperature": tmp})
-        DF_AG = pd.DataFrame(rows)
-        # Ensure all ids from list are present
-        missing = [aid for aid in dedup_agents if (DF_AG.empty or aid not in set(DF_AG["id"]))]
-        for mid in missing:
-            DF_AG = pd.concat([DF_AG, pd.DataFrame([{"id": mid, "name": "", "prompt": "", "temperature": None}])], ignore_index=True)
+rows = []
+if group_agents_dir.exists():
+    for yml in sorted(group_agents_dir.glob("*.yaml")):
+        Y = safe_read_yaml(yml)
+        ag_id = (Y.get("agent_id") or Y.get("id") or Y.get("id_agente") or yml.stem).strip()
+        ag_nm = (Y.get("agent_name") or Y.get("nome_agente") or Y.get("name") or "").strip()
+        pr    = str(Y.get("prompt", ""))
+        tmp   = Y.get("temp", Y.get("temperature", None))
+        try:
+            tmp = float(tmp) if tmp is not None else None
+        except Exception:
+            tmp = None
+        rows.append({"id": ag_id, "name": normalize_name(ag_nm), "prompt": pr, "temperature": tmp})
+DF_AG = pd.DataFrame(rows)
+
+# Ensure all ids from list are present
+missing = [aid for aid in dedup_agents if (DF_AG.empty or aid not in set(DF_AG.get("id", pd.Series(dtype=str))))]
+for mid in missing:
+    add_row = pd.DataFrame([{ "id": mid, "name": "", "prompt": "", "temperature": None }])
+    DF_AG = pd.concat([DF_AG, add_row], ignore_index=True)
+
+# If after all this DF_AG is still empty, emit an empty file for this group and continue
+if DF_AG.empty:
+    out_path = Path(args.out_dir) / f"groups_enriched_{group_id.replace(' ', '_')}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=2)
+    if args.verbose:
+        print(f"[WRITE] {out_path} → 0 agents (no YAMLs and no agent IDs listed)")
+    # minimal diagnostics line
+    diag = {"group_id": group_id, "n_agents": 0}
+    diagnostics_path = Path(args.out_dir) / "groups_enriched_diagnostics.jsonl"
+    with open(diagnostics_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(diag, ensure_ascii=False) + "
+")
+    continue
 
         # Match logs and compute raw metrics
-        metr_rows = []
-        dom_model: Dict[str, Optional[str]] = {}
-        for _, ag in DF_AG.iterrows():
-            ag_id = ag["id"]; ag_nm = ag.get("name", "")
-            mask_id = DF["selected_agent"].str.casefold() == ag_id.casefold()
-            if mask_id.any():
-                rows_df = DF.loc[mask_id]
+metr_rows = []
+dom_model: Dict[str, Optional[str]] = {}
+for _, ag in DF_AG.iterrows():
+    ag_id = ag["id"]; ag_nm = ag.get("name", "")
+    mask_id = DF["selected_agent"].str.casefold() == ag_id.casefold()
+    if mask_id.any():
+        rows_df = DF.loc[mask_id]
+    else:
+        if ag_nm:
+            mask_nm = DF["selected_agent"].str.casefold() == ag_nm.casefold()
+            rows_df = DF.loc[mask_nm]
+        else:
+            rows_df = DF.iloc[0:0]
+
+    if len(rows_df) == 0:
+        messages = 0.0; unique_users = 0; hhi = 1.0; diversity = 0.0; dominant_model = None
+    else:
+        messages = float(rows_df["w"].sum())
+        unique_users = int(rows_df["user"].nunique())
+        per_user_w = rows_df.groupby("user")["w"].sum()
+        tot = float(per_user_w.sum())
+        if tot <= 0.0:
+            hhi = 1.0
+        else:
+            shares = (per_user_w / tot).astype(float)
+            hhi = float((shares**2).sum())
+        diversity = max(0.0, min(1.0, 1.0 - hhi))
+        # dominant model
+        counts = rows_df.groupby("model").size().sort_values(ascending=False)
+        if len(counts) == 0:
+            dominant_model = None
+        else:
+            topc = counts.iloc[0]
+            tops = counts[counts == topc].index.tolist()
+            if len(tops) == 1:
+                dominant_model = str(tops[0])
             else:
-                if ag_nm:
-                    mask_nm = DF["selected_agent"].str.casefold() == ag_nm.casefold()
-                    rows_df = DF.loc[mask_nm]
-                else:
-                    rows_df = DF.iloc[0:0]
+                latest = rows_df.groupby("model")["timestamp"].max()
+                dominant_model = str(latest.loc[tops].idxmax())
 
-            if len(rows_df) == 0:
-                messages = 0.0; unique_users = 0; hhi = 1.0; diversity = 0.0; dominant_model = None
-            else:
-                messages = float(rows_df["w"].sum())
-                unique_users = int(rows_df["user"].nunique())
-                per_user_w = rows_df.groupby("user")["w"].sum()
-                tot = float(per_user_w.sum())
-                if tot <= 0.0:
-                    hhi = 1.0
-                else:
-                    shares = (per_user_w / tot).astype(float)
-                    hhi = float((shares**2).sum())
-                diversity = max(0.0, min(1.0, 1.0 - hhi))
-                # dominant model
-                counts = rows_df.groupby("model").size().sort_values(ascending=False)
-                if len(counts) == 0:
-                    dominant_model = None
-                else:
-                    topc = counts.iloc[0]
-                    tops = counts[counts == topc].index.tolist()
-                    if len(tops) == 1:
-                        dominant_model = str(tops[0])
-                    else:
-                        latest = rows_df.groupby("model")["timestamp"].max()
-                        dominant_model = str(latest.loc[tops].idxmax())
+    metr_rows.append({"id": ag_id, "messages": messages, "unique_users": unique_users, "hhi": hhi, "diversity": diversity})
+    dom_model[ag_id] = dominant_model
 
-            metr_rows.append({"id": ag_id, "messages": messages, "unique_users": unique_users, "hhi": hhi, "diversity": diversity})
-            dom_model[ag_id] = dominant_model
-
-        DF_METR = pd.DataFrame(metr_rows).set_index("id")
+# If no metric rows (shouldn't happen if DF_AG non-empty), build a zero frame
+if len(metr_rows) == 0:
+    DF_METR = pd.DataFrame({
+        "id": DF_AG["id"],
+        "messages": np.zeros(len(DF_AG)),
+        "unique_users": np.zeros(len(DF_AG), dtype=int),
+        "hhi": np.ones(len(DF_AG)),
+        "diversity": np.zeros(len(DF_AG)),
+    }).set_index("id")
+else:
+    DF_METR = pd.DataFrame(metr_rows).set_index("id")
         if args.score_scope == "global":
             global_metrics_frames.append(DF_METR.assign(__group_id__=group_id))
         per_group_outputs.append((group_id, DF_AG, DF_METR, owner, members))
