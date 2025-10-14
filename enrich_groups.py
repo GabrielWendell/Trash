@@ -114,7 +114,8 @@ def parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
 
 
 def empty_like_series(s: pd.Series) -> pd.Series:
-    s_str = s.astype(str).strip().str.lower()
+    # Correct pandas string ops: use .str.strip() instead of .strip()
+    s_str = s.astype(str).str.strip().str.lower()
     return s.isna() | s_str.isin(["", "nan", "none", "null"])
 
 
@@ -324,7 +325,7 @@ def main() -> None:
         DF_METR = pd.DataFrame(metr_rows).set_index("id")
         if args.score_scope == "global":
             global_metrics_frames.append(DF_METR.assign(__group_id__=group_id))
-        per_group_outputs.append((group_id, DF_AG, DF_METR))
+        per_group_outputs.append((group_id, DF_AG, DF_METR, owner, members))
 
     # Compute scores
     def score_frame(dfm: pd.DataFrame) -> pd.DataFrame:
@@ -345,7 +346,7 @@ def main() -> None:
     with open(diagnostics_path, "w", encoding="utf-8") as _:
         pass  # truncate file
 
-    for group_id, DF_AG, DF_METR in per_group_outputs:
+    for group_id, DF_AG, DF_METR, owner, members in per_group_outputs:
         if args.score_scope == "per-group":
             DF_SCO = score_frame(DF_METR)
         else:
@@ -386,9 +387,9 @@ def main() -> None:
                 "description":  desc,
                 "id":           ag_id,
                 "name":         ag.get("name") or None,
-                "owner":        owner if 'owner' in locals() else None,  # group owner
+                "owner":        owner or None,  # group owner from this group
                 "score":        float(DF_SCO.loc[ag_id, "score"]) if ag_id in DF_SCO.index else 0.0,
-                "shared_with":  members if 'members' in locals() else [],
+                "shared_with":  members or [],
                 "visibility":   "group",
                 "model":        dominant_model,
                 "prompt":       ag.get("prompt", ""),
