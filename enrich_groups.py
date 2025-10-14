@@ -1,54 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EVA Groups → Enriched JSON per group
-===================================
+EVA Groups → Enriched JSON per group (FIXED)
+-------------------------------------------
 
-Scans the groups directory structure and, for each group, emits a JSON file
-listing all member agents with enriched fields derived from YAML + usage logs.
+Robust implementation that scans the groups tree and, for each group, emits a
+JSON with enriched agent fields by cross-matching agent YAMLs with EVA logs.
 
-- Folder layout (example):
-  Agents_Chatbots/s3_agents_download/groups/
-    └── <group_id>/
-        ├── <group_id>.yaml          # group definition (agents, members, owner)
-        └── group_agents/
-            ├── <agent_id_1>.yaml   # per-agent YAML (desc, agent_id, agent_name, prompt, temp)
-            └── <agent_id_2>.yaml
+Key fixes vs previous draft
+- Correct use of Pandas string ops (.str.strip()) in filters.
+- Proper indentation inside the group loop (no stray top-level blocks).
+- Safe handling of groups with zero agents (writes empty JSON + diagnostics).
+- Diagnostics newline bug fixed.
+- Carries owner/members and dominant model per group through to the writer.
 
-- Output (per group): groups_enriched_<slug(group_id)>.json
-  Each record:
-    {
-      "description": str,      # summary from prompt (LLM stub + deterministic fallback)
-      "id": str,               # agent id
-      "name": str|null,       
-      "owner": str|null,      # group owner (fallback for agent owner)
-      "score": float,         # computed via log-normalized + harmonic mean × diversity
-      "shared_with": [str],   # members (emails)
-      "visibility": "group",
-      "model": str|null,      # dominant model for this agent in logs
-      "prompt": str,
-      "temperature": float|null
-    }
-
-- Diagnostics appended to groups_enriched_diagnostics.jsonl (optionally).
-
-CLI
----
-Example:
-  python enrich_groups.py \
-    --groups-root "Agents_Chatbots/s3_agents_download/groups" \
-    --logs-dir logs_csv \
-    --out-dir results_groups \
-    --alpha 0.15 \
-    --decay 0.0 \
-    --score-scope per-group \
-    --verbose
-
-Notes
------
-- Visibility is fixed to "group" in this context.
-- Matching strategy: try selected_agent == agent_id first; else selected_agent == agent_name.
-- The summarizer is offline by default; replace PromptSummarizer.summarize() if you want LLM.
+CLI example
+    python enrich_groups_fixed.py \
+      --groups-root "Agents_Chatbots/s3_agents_download/groups" \
+      --logs-dir logs_csv/with_model_column \
+      --out-dir results_groups \
+      --alpha 0.15 \
+      --decay 0.0 \
+      --score-scope per-group \
+      --verbose
 """
 from __future__ import annotations
 
@@ -114,7 +88,7 @@ def parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
 
 
 def empty_like_series(s: pd.Series) -> pd.Series:
-    # Correct pandas string ops: use .str.strip() instead of .strip()
+    # correct vectorized ops
     s_str = s.astype(str).str.strip().str.lower()
     return s.isna() | s_str.isin(["", "nan", "none", "null"])
 
@@ -208,6 +182,10 @@ def harmonic_mean(a: pd.Series, b: pd.Series) -> pd.Series:
 
 # --------------------------- Main ------------------------------------
 
+def _slug(s: str) -> str:
+    return (s or "").replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+
 def main() -> None:
     args = parse_args()
     groups_root = Path(args.groups_root)
@@ -233,10 +211,12 @@ def main() -> None:
 
     summarizer = PromptSummarizer()
 
-    # Optionally accumulate for global scoring
-    global_metrics_frames = []
-    per_group_outputs: List[Tuple[str, pd.DataFrame, pd.DataFrame, str, List[str]]] = []  # (group_id, DF_AG, DF_METR, owner, members)
+    # Accumulators for scoring/writing
+    global_metrics_frames: List[pd.DataFrame] = []
+    # (group_id, DF_AG, DF_METR, owner, members, dom_model_map)
+    per_group_outputs: List[Tuple[str, pd.DataFrame, pd.DataFrame, str, List[str], Dict[str, Optional[str]]]] = []
 
+    # Iterate groups
     for group_dir in sorted([d for d in groups_root.iterdir() if d.is_dir()]):
         group_id = group_dir.name
         group_yaml = group_dir / f"{group_id}.yaml"
@@ -246,11 +226,10 @@ def main() -> None:
                 print(f"[WARN] Missing group YAML: {group_yaml}")
             continue
         G = safe_read_yaml(group_yaml)
-        # tolerant keys
         agents_list = G.get("agents", [])
         agents_list = [str(a).strip() for a in agents_list if str(a).strip()]
-        # dedupe but preserve order
-        seen = set(); dedup_agents = []
+        # dedupe (preserve order)
+        seen = set(); dedup_agents: List[str] = []
         for a in agents_list:
             if a not in seen:
                 seen.add(a); dedup_agents.append(a)
@@ -258,147 +237,74 @@ def main() -> None:
         members = [normalize_email(m) for m in members if m]
         owner = normalize_email(G.get("owner", ""))
 
-        # Build agent table from YAMLs
-rows = []
-if group_agents_dir.exists():
-    for yml in sorted(group_agents_dir.glob("*.yaml")):
-        Y = safe_read_yaml(yml)
-        ag_id = (Y.get("agent_id") or Y.get("id") or Y.get("id_agente") or yml.stem).strip()
-        ag_nm = (Y.get("agent_name") or Y.get("nome_agente") or Y.get("name") or "").strip()
-        pr    = str(Y.get("prompt", ""))
-        tmp   = Y.get("temp", Y.get("temperature", None))
-        try:
-            tmp = float(tmp) if tmp is not None else None
-        except Exception:
-            tmp = None
-        rows.append({"id": ag_id, "name": normalize_name(ag_nm), "prompt": pr, "temperature": tmp})
-DF_AG = pd.DataFrame(rows)
+        # Build DF_AG from YAMLs under group_agents
+        rows: List[Dict[str, object]] = []
+        if group_agents_dir.exists():
+            for yml in sorted(group_agents_dir.glob("*.yaml")):
+                Y = safe_read_yaml(yml)
+                ag_id = (Y.get("agent_id") or Y.get("id") or Y.get("id_agente") or yml.stem)
+                ag_id = str(ag_id).strip()
+                ag_nm = (Y.get("agent_name") or Y.get("nome_agente") or Y.get("name") or "")
+                ag_nm = str(ag_nm).strip()
+                pr    = str(Y.get("prompt", ""))
+                tmp   = Y.get("temp", Y.get("temperature", None))
+                try:
+                    tmp = float(tmp) if tmp is not None else None
+                except Exception:
+                    tmp = None
+                rows.append({"id": ag_id, "name": normalize_name(ag_nm), "prompt": pr, "temperature": tmp})
+        DF_AG = pd.DataFrame(rows)
 
-# Ensure all ids from list are present
-missing = [aid for aid in dedup_agents if (DF_AG.empty or aid not in set(DF_AG.get("id", pd.Series(dtype=str))))]
-for mid in missing:
-    add_row = pd.DataFrame([{ "id": mid, "name": "", "prompt": "", "temperature": None }])
-    DF_AG = pd.concat([DF_AG, add_row], ignore_index=True)
+        # Ensure IDs from the group list are represented
+        existing_ids = set(DF_AG["id"]) if not DF_AG.empty else set()
+        for mid in dedup_agents:
+            if mid not in existing_ids:
+                DF_AG = pd.concat([DF_AG, pd.DataFrame([{ "id": mid, "name": "", "prompt": "", "temperature": None }])], ignore_index=True)
+                existing_ids.add(mid)
 
-# If after all this DF_AG is still empty, emit an empty file for this group and continue
-if DF_AG.empty:
-    out_path = Path(args.out_dir) / f"groups_enriched_{group_id.replace(' ', '_')}.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump([], f, ensure_ascii=False, indent=2)
-    if args.verbose:
-        print(f"[WRITE] {out_path} → 0 agents (no YAMLs and no agent IDs listed)")
-    # minimal diagnostics line
-    diag = {"group_id": group_id, "n_agents": 0}
-    diagnostics_path = Path(args.out_dir) / "groups_enriched_diagnostics.jsonl"
-    # ensure diagnostics file exists
-    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(diagnostics_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(diag, ensure_ascii=False) + "
-")
-    continue
+        # If still empty → write empty JSON and continue
+        if DF_AG.empty:
+            out_path = out_dir / f"groups_enriched_{_slug(group_id)}.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
+            if args.verbose:
+                print(f"[WRITE] {out_path} → 0 agents (no YAMLs and no agent IDs listed)")
+            # diagnostics
+            diagnostics_path = out_dir / "groups_enriched_diagnostics.jsonl"
+            diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(diagnostics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"group_id": group_id, "n_agents": 0}, ensure_ascii=False) + "\n")
+            continue
 
-        # Match logs and compute raw metrics
-metr_rows = []
-dom_model: Dict[str, Optional[str]] = {}
-for _, ag in DF_AG.iterrows():
-    ag_id = ag["id"]; ag_nm = ag.get("name", "")
-    mask_id = DF["selected_agent"].str.casefold() == ag_id.casefold()
-    if mask_id.any():
-        rows_df = DF.loc[mask_id]
-    else:
-        if ag_nm:
-            mask_nm = DF["selected_agent"].str.casefold() == ag_nm.casefold()
-            rows_df = DF.loc[mask_nm]
-        else:
-            rows_df = DF.iloc[0:0]
-
-    if len(rows_df) == 0:
-        messages = 0.0; unique_users = 0; hhi = 1.0; diversity = 0.0; dominant_model = None
-    else:
-        messages = float(rows_df["w"].sum())
-        unique_users = int(rows_df["user"].nunique())
-        per_user_w = rows_df.groupby("user")["w"].sum()
-        tot = float(per_user_w.sum())
-        if tot <= 0.0:
-            hhi = 1.0
-        else:
-            shares = (per_user_w / tot).astype(float)
-            hhi = float((shares**2).sum())
-        diversity = max(0.0, min(1.0, 1.0 - hhi))
-        # dominant model
-        counts = rows_df.groupby("model").size().sort_values(ascending=False)
-        if len(counts) == 0:
-            dominant_model = None
-        else:
-            topc = counts.iloc[0]
-            tops = counts[counts == topc].index.tolist()
-            if len(tops) == 1:
-                dominant_model = str(tops[0])
-            else:
-                latest = rows_df.groupby("model")["timestamp"].max()
-                dominant_model = str(latest.loc[tops].idxmax())
-
-    metr_rows.append({"id": ag_id, "messages": messages, "unique_users": unique_users, "hhi": hhi, "diversity": diversity})
-    dom_model[ag_id] = dominant_model
-
-# If no metric rows (shouldn't happen if DF_AG non-empty), build a zero frame
-if len(metr_rows) == 0:
-    DF_METR = pd.DataFrame({
-        "id": DF_AG["id"],
-        "messages": np.zeros(len(DF_AG)),
-        "unique_users": np.zeros(len(DF_AG), dtype=int),
-        "hhi": np.ones(len(DF_AG)),
-        "diversity": np.zeros(len(DF_AG)),
-    }).set_index("id")
-else:
-    DF_METR = pd.DataFrame(metr_rows).set_index("id")
-        if args.score_scope == "global":
-            global_metrics_frames.append(DF_METR.assign(__group_id__=group_id))
-        per_group_outputs.append((group_id, DF_AG, DF_METR, owner, members))
-
-    # Compute scores
-    def score_frame(dfm: pd.DataFrame) -> pd.DataFrame:
-        na = log_normalize(dfm["messages"]) ; nu = log_normalize(dfm["unique_users"]) ; div = dfm["diversity"].clip(0,1)
-        scoreH = (2.0*na*nu)/(na+nu) ; scoreH[(na+nu)==0.0] = 0.0
-        score = scoreH * (args.alpha + (1.0 - args.alpha) * div)
-        return dfm.assign(scoreH=scoreH, score=score)
-
-    global_scores: Optional[pd.DataFrame] = None
-    if args.score_scope == "global" and global_metrics_frames:
-        GALL = pd.concat(global_metrics_frames, axis=0)
-        # drop helper col after scoring
-        global_scores = score_frame(GALL.drop(columns=["__group_id__"]))
-        global_scores["__group_id__"] = GALL["__group_id__"].values
-
-    # Write outputs per group
-    diagnostics_path = Path(args.out_dir) / "groups_enriched_diagnostics.jsonl"
-    with open(diagnostics_path, "w", encoding="utf-8") as _:
-        pass  # truncate file
-
-    for group_id, DF_AG, DF_METR, owner, members in per_group_outputs:
-        if args.score_scope == "per-group":
-            DF_SCO = score_frame(DF_METR)
-        else:
-            # slice scores for this group
-            assert global_scores is not None
-            ids = DF_METR.index
-            DF_SCO = global_scores.loc[ids]
-
-        # Build output records
-        records = []
+        # Match logs and compute metrics + dominant model per agent
+        metr_rows: List[Dict[str, object]] = []
+        dom_model: Dict[str, Optional[str]] = {}
         for _, ag in DF_AG.iterrows():
-            ag_id = ag["id"]
-            # We need the dominant model computed earlier. Recompute quickly here:
+            ag_id = str(ag["id"]) ; ag_nm = str(ag.get("name", ""))
             mask_id = DF["selected_agent"].str.casefold() == ag_id.casefold()
             if mask_id.any():
                 rows_df = DF.loc[mask_id]
             else:
-                ag_nm = ag.get("name", "")
-                mask_nm = DF["selected_agent"].str.casefold() == ag_nm.casefold() if ag_nm else DF.index == -1
-                rows_df = DF.loc[mask_nm]
+                if ag_nm:
+                    mask_nm = DF["selected_agent"].str.casefold() == ag_nm.casefold()
+                    rows_df = DF.loc[mask_nm]
+                else:
+                    rows_df = DF.iloc[0:0]
+
             if len(rows_df) == 0:
-                dominant_model = None
+                messages = 0.0; unique_users = 0; hhi = 1.0; diversity = 0.0; dominant_model = None
             else:
+                messages = float(rows_df["w"].sum())
+                unique_users = int(rows_df["user"].nunique())
+                per_user_w = rows_df.groupby("user")["w"].sum()
+                tot = float(per_user_w.sum())
+                if tot <= 0.0:
+                    hhi = 1.0
+                else:
+                    shares = (per_user_w / tot).astype(float)
+                    hhi = float((shares**2).sum())
+                diversity = max(0.0, min(1.0, 1.0 - hhi))
+                # dominant model
                 counts = rows_df.groupby("model").size().sort_values(ascending=False)
                 if len(counts) == 0:
                     dominant_model = None
@@ -411,40 +317,81 @@ else:
                         latest = rows_df.groupby("model")["timestamp"].max()
                         dominant_model = str(latest.loc[tops].idxmax())
 
-            desc = PromptSummarizer().summarize(str(ag.get("prompt", "")))
+            metr_rows.append({"id": ag_id, "messages": messages, "unique_users": unique_users, "hhi": hhi, "diversity": diversity})
+            dom_model[ag_id] = dominant_model
+
+        # Build metrics frame (or zero frame if somehow empty)
+        if len(metr_rows) == 0:
+            DF_METR = pd.DataFrame({
+                "id": DF_AG["id"],
+                "messages": np.zeros(len(DF_AG)),
+                "unique_users": np.zeros(len(DF_AG), dtype=int),
+                "hhi": np.ones(len(DF_AG)),
+                "diversity": np.zeros(len(DF_AG)),
+            }).set_index("id")
+        else:
+            DF_METR = pd.DataFrame(metr_rows).set_index("id")
+
+        if args.score_scope == "global":
+            global_metrics_frames.append(DF_METR.assign(__group_id__=group_id))
+        per_group_outputs.append((group_id, DF_AG, DF_METR, owner, members, dom_model))
+
+    # ---------- Scoring utilities ----------
+    def score_frame(dfm: pd.DataFrame) -> pd.DataFrame:
+        na = log_normalize(dfm["messages"]) ; nu = log_normalize(dfm["unique_users"]) ; div = dfm["diversity"].clip(0,1)
+        scoreH = (2.0*na*nu)/(na+nu) ; scoreH[(na+nu)==0.0] = 0.0
+        score = scoreH * (args.alpha + (1.0 - args.alpha) * div)
+        return dfm.assign(scoreH=scoreH, score=score)
+
+    global_scores: Optional[pd.DataFrame] = None
+    if args.score_scope == "global" and global_metrics_frames:
+        GALL = pd.concat(global_metrics_frames, axis=0)
+        global_scores = score_frame(GALL.drop(columns=["__group_id__"]))
+        global_scores["__group_id__"] = GALL["__group_id__"].values
+
+    # Prepare diagnostics file (truncate)
+    diagnostics_path = out_dir / "groups_enriched_diagnostics.jsonl"
+    with open(diagnostics_path, "w", encoding="utf-8") as _:
+        pass
+
+    # ---------- Write outputs per group ----------
+    for group_id, DF_AG, DF_METR, owner, members, dom_model in per_group_outputs:
+        if args.score_scope == "per-group":
+            DF_SCO = score_frame(DF_METR)
+        else:
+            assert global_scores is not None
+            DF_SCO = global_scores.loc[DF_METR.index]
+
+        records: List[Dict[str, object]] = []
+        for _, ag in DF_AG.iterrows():
+            ag_id = str(ag["id"])
+            desc = summarizer.summarize(str(ag.get("prompt", "")))
             rec = {
                 "description":  desc,
                 "id":           ag_id,
                 "name":         ag.get("name") or None,
-                "owner":        owner or None,  # group owner from this group
+                "owner":        owner or None,
                 "score":        float(DF_SCO.loc[ag_id, "score"]) if ag_id in DF_SCO.index else 0.0,
                 "shared_with":  members or [],
                 "visibility":   "group",
-                "model":        dominant_model,
+                "model":        dom_model.get(ag_id),
                 "prompt":       ag.get("prompt", ""),
                 "temperature":  (None if pd.isna(ag.get("temperature")) else float(ag.get("temperature"))) if ("temperature" in ag) else None,
             }
-            # Clean NaNs/infs in numeric fields
             for k in ["score", "temperature"]:
                 v = rec[k]
                 if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                     rec[k] = None
             records.append(rec)
 
-        out_path = Path(args.out_dir) / f"groups_enriched_{group_id.replace(' ', '_')}.json"
+        out_path = out_dir / f"groups_enriched_{_slug(group_id)}.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
         if args.verbose:
             print(f"[WRITE] {out_path} → {len(records)} agents")
 
-        # diagnostics: duplicates, missing YAMLs, etc. — we no longer have those local vars here, recompute:
-        # (Alternatively, compute inside the main loop and capture via closure; here we’ll write minimal info.)
-        diag = {
-            "group_id": group_id,
-            "n_agents": len(records),
-        }
         with open(diagnostics_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(diag, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"group_id": group_id, "n_agents": len(records)}, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
