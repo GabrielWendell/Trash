@@ -1,562 +1,440 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EVA Agent Recommender
----------------------
-End-to-end pipeline to produce overall and per-model Top-N agent recommendations
-from EVA access logs converted to CSV.
+EVA Agents → Enriched JSON (Public/Private) **ONLY IaraGenAI descriptions**
+===========================================================================
 
-Features
-========
-- Handles mixed schemas (7 vs 8 columns). Ensures a canonical set of columns:
-  ['timestamp','user','page','message','__line__','type','selected_agent','model']
-- Enforces policy filters:
-    * drop rows with page == 'landing'
-    * drop rows where selected_agent is NaN
-    * drop rows where model is NaN
-- Robust CSV reading (python engine, dtype=str where suitable) and timestamp parsing.
-- Optional recency weighting with exponential decay.
-- Scoring: log-normalized + harmonic mean (messages vs unique users) with a diversity
-  penalty derived from HHI (Herfindahl–Hirschman Index).
-- Emits overall and per-model Top-N JSONs containing key metrics.
-- Optional enrichment from agent registry (if available) using s3_base.AgentManager.
-- Verbose diagnostics (row drops, schema mix, concentration distribution, etc.).
+This script scans agents in `public/` and `private/`, cross-matches with EVA
+logs to compute engagement metrics and a recommendation score, and emits
+per-visibility JSON files with the following fields per agent:
 
-CLI
-===
+    description, id, name, owner, username, score, visibility, model,
+    prompt, temperature
+
+⚠️ Important: **No heuristic summarizer is used.** Descriptions are generated
+**exclusively** by Itaú's internal LLM via `mrm_copilot.core.agents.Agent`
+(IaraGenAI). If Iara is unavailable or returns an empty string, the script will
+record a placeholder message indicating the failure; it will NOT fall back to
+any heuristic.
+
 Example:
-    python recommend_agents.py \
-        --logs-dir logs_csv \
-        --out-dir results \
-        --topk 10 \
-        --alpha 0.15 \
-        --decay 0.0 \
-        --per-model \
-        --verbose
-
-Notes
-=====
-- This script expects the CSVs produced by your logs-to-CSV converter.
-- If you want per-session "accesses", you can enable sessionization with
-  --session-gap-mins (e.g. 30). By default, we report messages (=rows) only.
-- If s3_base.py is present and AWS credentials are configured, the script will
-  try to enrich each agent with owner/name from S3; otherwise it gracefully
-  continues without enrichment.
+    python enrich_agents_IaraGenAI.py \
+      --agents-root "ChatBots Files/s3_agents_download" \
+      --logs-dir logs_csv \
+      --out-dir results_enriched \
+      --visibilities public private \
+      --alpha 0.15 --decay 0.0 --score-scope global \
+      --iara-model gpt-4.1-2025-04-14 --iara-sleep 0.6 --iara-retries 2 \
+      --verbose
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import os
-import sys
-from collections import defaultdict
-from datetime import datetime, timezone
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import yaml
 
-# Optional import: agent registry (graceful fallback if missing)
-AGENT_REGISTRY_AVAILABLE = False
-try:
-    from s3_base import AgentManager  # type: ignore
-    AGENT_REGISTRY_AVAILABLE = True
-except Exception:
-    AGENT_REGISTRY_AVAILABLE = False
+# ----------------------------- CLI ------------------------------------
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Enrich EVA agents (IaraGenAI-only descriptions, no heuristics)")
+    p.add_argument("--agents-root", required=True, type=str,
+                   help="Root path containing public/ and private/ subfolders")
+    p.add_argument("--logs-dir", required=True, type=str,
+                   help="Directory with pre-converted CSV logs (with model column)")
+    p.add_argument("--out-dir", required=True, type=str, help="Directory to write JSON outputs")
+    p.add_argument("--visibilities", nargs="*", default=["public", "private"],
+                   help="Which visibilities to include (default: public private)")
+    p.add_argument("--alpha", type=float, default=0.15, help="Diversity penalty floor [0..1]")
+    p.add_argument("--decay", type=float, default=0.0, help="Recency exponential decay per day (0 disables)")
+    p.add_argument("--score-scope", choices=["global", "per-folder"], default="global",
+                   help="Score normalization across all selected folders or per folder")
+    # Iara controls
+    p.add_argument("--iara-model", type=str, default="gpt-4.1-2025-04-14", help="IaraGenAI model name")
+    p.add_argument("--iara-sleep", type=float, default=0.6, help="Seconds to sleep between Iara calls")
+    p.add_argument("--iara-retries", type=int, default=2, help="Retries per description on transient errors")
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args()
 
-REQUIRED_COLUMNS = [
-    "timestamp",
-    "user",
-    "page",
-    "message",
-    "__line__",
-    "type",
-    "selected_agent",
-    "model",
+# ----------------------- Log loading & filters -------------------------
+
+REQUIRED_LOG_COLUMNS = [
+    "timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"
 ]
-
 TIMESTAMP_FMT = "%Y-%m-%d-%H-%M-%S"  # e.g., 2025-09-01-08-43-38
+VALID_VISIBILITIES = {"public", "private"}
 
 
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="EVA Agent Recommender")
-    parser.add_argument("--logs-dir", required=True, type=str,
-                        help="Directory containing CSV logs (already converted from .log)")
-    parser.add_argument("--out-dir", required=True, type=str,
-                        help="Directory to write output JSON files")
-    parser.add_argument("--topk", type=int, default=10, help="Top-K agents to emit")
-    parser.add_argument("--alpha", type=float, default=0.15,
-                        help="Diversity penalty floor (0=no floor, 1=no penalty)")
-    parser.add_argument("--decay", type=float, default=0.0,
-                        help="Recency exponential decay per day (0 disables)")
-    parser.add_argument("--per-model", action="store_true",
-                        help="Also compute per-model leaderboards")
-    parser.add_argument("--session-gap-mins", type=int, default=0,
-                        help="If >0, compute per-user sessions as accesses using this gap. 0=disabled")
-    parser.add_argument("--bucket", type=str, default=None,
-                        help="(Optional) S3 bucket for agent registry enrichment")
-    parser.add_argument("--user-email", type=str, default=None,
-                        help="(Optional) Current user email for AgentManager context")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print diagnostics")
-    return parser.parse_args()
-
-
-def _ensure_out_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def _read_csv_robust(path: Path) -> pd.DataFrame:
-    """Read CSV with a tolerant parser and return a DataFrame of strings when possible.
-    We avoid dtype inference pitfalls by loading as object and converting later as needed.
-    """
+def read_csv_robust(path: Path) -> pd.DataFrame:
     try:
-        df = pd.read_csv(
-            path,
-            engine="python",
-            dtype=str,
-            keep_default_na=True,
-            na_values=["", "None", "null", "NaN", "nan"],
-            on_bad_lines="skip",
-        )
-    except TypeError:
-        # pandas<2.0 compatibility (on_bad_lines keyword difference)
-        df = pd.read_csv(
-            path,
-            engine="python",
-            dtype=str,
-            keep_default_na=True,
-            na_values=["", "None", "null", "NaN", "nan"],
-            error_bad_lines=False,  # deprecated in new pandas
-            warn_bad_lines=True,
-        )
-    # Normalize columns: if model is missing, add it
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-    # Keep only required columns, in order
-    df = df[REQUIRED_COLUMNS]
-    return df
+        df = pd.read_csv(path, engine="python", dtype=str, keep_default_na=True,
+                         na_values=["", "None", "null", "NaN", "nan"], on_bad_lines="skip")
+    except TypeError:  # pandas<2
+        df = pd.read_csv(path, engine="python", dtype=str, keep_default_na=True,
+                         na_values=["", "None", "null", "NaN", "nan"], error_bad_lines=False, warn_bad_lines=True)
+    for c in REQUIRED_LOG_COLUMNS:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[REQUIRED_LOG_COLUMNS]
 
 
-def _parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
+def parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
     def _parse_one(x: str) -> pd.Timestamp:
         if pd.isna(x):
             return pd.NaT
-        x = str(x).strip()
+        s = str(x).strip()
         try:
-            return pd.to_datetime(x, format=TIMESTAMP_FMT, utc=True)
+            return pd.to_datetime(s, format=TIMESTAMP_FMT, utc=True)
         except Exception:
-            # Fallback: attempt auto-parse
             try:
-                return pd.to_datetime(x, utc=True)
+                return pd.to_datetime(s, utc=True)
             except Exception:
                 return pd.NaT
     return df["timestamp"].apply(_parse_one)
 
 
-def _policy_filter(df: pd.DataFrame, verbose: bool = False) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """Apply bank policy filters and report drops.
-    Drops rows where:
-      - page == 'landing'
-      - selected_agent is NaN or in {"", "nan", "none", "null"} (case-insensitive)
-      - model is NaN or in {"", "nan", "none", "null"} (case-insensitive)
-    """
-    stats: Dict[str, int] = {}
+def empty_like_series(s: pd.Series) -> pd.Series:
+    s_str = s.astype(str).str.strip().str.lower()
+    return s.isna() | s_str.isin(["", "nan", "none", "null"])
+
+
+def policy_filter(df: pd.DataFrame, verbose: bool=False) -> Tuple[pd.DataFrame, Dict[str,int]]:
+    stats: Dict[str,int] = {}
     n0 = len(df)
-
-    # page != landing
     mask = df["page"].astype(str).str.strip().str.lower() == "landing"
-    stats["dropped_landing"] = int(mask.sum())
-    df = df.loc[~mask]
-
-    # helper to detect empty-like strings
-    def _empty_like(s: pd.Series) -> pd.Series:
-        s_str = s.astype(str).str.strip().str.lower()
-        return s.isna() | s_str.isin(["", "nan", "none", "null"])
-
-    # drop invalid selected_agent
-    mask = _empty_like(df["selected_agent"])  # catches NaN and string placeholders
-    stats["dropped_selected_agent_nan"] = int(mask.sum())
-    df = df.loc[~mask]
-
-    # drop invalid model
-    mask = _empty_like(df["model"])  # catches NaN and string placeholders
-    stats["dropped_model_nan"] = int(mask.sum())
-    df = df.loc[~mask]
-
-    stats["kept_after_filters"] = int(len(df))
-    stats["dropped_total"] = int(n0 - len(df))
-
+    stats["dropped_landing"] = int(mask.sum()); df = df.loc[~mask]
+    mask = empty_like_series(df["selected_agent"]) ; stats["dropped_selected_agent_invalid"] = int(mask.sum()); df = df.loc[~mask]
+    mask = empty_like_series(df["model"])        ; stats["dropped_model_invalid"]         = int(mask.sum()); df = df.loc[~mask]
+    stats["kept_after_filters"] = int(len(df)); stats["dropped_total"] = int(n0 - len(df))
     if verbose:
-        print("[FILTER] Drops:", json.dumps(stats, indent=2))
+        print("[FILTER]", json.dumps(stats, indent=2))
     return df, stats
 
 
-def _standardize_strings(df: pd.DataFrame) -> pd.DataFrame:
-    # canonicalize user emails and agent/model identifiers
+def standardize_strings(df: pd.DataFrame) -> pd.DataFrame:
     df["user"] = df["user"].astype(str).str.strip().str.lower()
     df["selected_agent"] = df["selected_agent"].astype(str).str.strip()
     df["model"] = df["model"].astype(str).str.strip()
     return df
 
 
-def _add_recency_weight(df: pd.DataFrame, decay: float) -> pd.DataFrame:
+def add_recency_weight(df: pd.DataFrame, decay: float) -> pd.DataFrame:
     if decay <= 0.0:
-        df["w"] = 1.0
-        return df
+        df["w"] = 1.0; return df
     now = pd.Timestamp.utcnow()
     age_days = (now - df["timestamp"]).dt.total_seconds() / 86400.0
     df["w"] = np.exp(-decay * age_days.astype(float))
     return df
 
+# -------------------------- YAML helpers ------------------------------
 
-def _sessionize_accesses(
-    df: pd.DataFrame, gap_minutes: int
-) -> Optional[pd.DataFrame]:
-    """Compute per-(user, agent) sessions using a time gap heuristic.
-    Returns a DataFrame with columns: selected_agent, user, sessions
-    """
-    if gap_minutes <= 0:
-        return None
-
-    df2 = df.sort_values(["selected_agent", "user", "timestamp"]).copy()
-    grp = df2.groupby(["selected_agent", "user"], sort=False)
-
-    def count_sessions(g: pd.DataFrame) -> int:
-        ts = g["timestamp"].values
-        if len(ts) == 0:
-            return 0
-        # Count a new session whenever gap > threshold
-        gaps = (g["timestamp"].diff().dt.total_seconds() / 60.0).fillna(float("inf"))
-        return int((gaps > gap_minutes).sum())
-
-    sessions = grp.apply(count_sessions).rename("sessions").reset_index()
-    return sessions
+@dataclass
+class AgentRow:
+    id: str
+    name: str
+    owner: str
+    prompt: str
+    temperature: float
+    visibility: str  # public/private
 
 
-# --------------------------------------------------------------------------------------
-# Aggregation & Scoring
-# --------------------------------------------------------------------------------------
-
-def _compute_hhi_from_weighted_counts(wcounts: pd.Series) -> float:
-    total = float(wcounts.sum())
-    if total <= 0.0:
-        return 1.0  # degenerate; treat as fully concentrated
-    shares = (wcounts / total).astype(float)
-    return float((shares ** 2).sum())
-
-
-def _aggregate_agent_metrics(
-    df: pd.DataFrame,
-    session_gap_mins: int = 0,
-    verbose: bool = False,
-) -> pd.DataFrame:
-    """Return DataFrame indexed by selected_agent with columns:
-    messages, unique_users, hhi, diversity, accesses(optional)
-    """
-    # messages: weighted count of rows
-    messages = df.groupby("selected_agent")["w"].sum().rename("messages")
-
-    # unique users
-    unique_users = df.groupby("selected_agent")["user"].nunique().rename("unique_users")
-
-    # HHI: compute per-agent per-user weighted counts
-    per_user_w = (
-        df.groupby(["selected_agent", "user"])  # type: ignore
-        ["w"].sum()
-        .rename("wcount")
-    )
-
-    hhi = (
-        per_user_w
-        .groupby(level=0)
-        .apply(_compute_hhi_from_weighted_counts)
-        .rename("hhi")
-        .astype(float)
-    )
-    diversity = (1.0 - hhi).clip(0.0, 1.0).rename("diversity")
-
-    out = pd.concat([messages, unique_users, hhi, diversity], axis=1)
-
-    # Optional: accesses via sessionization
-    if session_gap_mins > 0:
-        sessions_df = _sessionize_accesses(df, session_gap_mins)
-        if sessions_df is not None and len(sessions_df):
-            accesses = (
-                sessions_df.groupby("selected_agent")["sessions"].sum().rename("accesses")
-            )
-            out = out.join(accesses, how="left")
-        else:
-            out["accesses"] = np.nan
-    return out.fillna({"messages": 0.0, "unique_users": 0, "hhi": 1.0, "diversity": 0.0})
-
-
-def _log_normalize(series: pd.Series) -> pd.Series:
-    maxv = float(series.max()) if len(series) else 0.0
-    if maxv <= 0:
-        return pd.Series(np.zeros(len(series)), index=series.index, dtype=float)
-    return np.log1p(series.astype(float)) / math.log1p(maxv)
-
-
-def _harmonic_mean(a: pd.Series, b: pd.Series) -> pd.Series:
-    denom = (a + b)
-    hm = 2.0 * a * b / denom
-    hm[denom == 0.0] = 0.0
-    return hm
-
-
-def _score_agents(df_metrics: pd.DataFrame, alpha: float) -> pd.DataFrame:
-    # Log-normalize messages and unique_users
-    na = _log_normalize(df_metrics["messages"])  # in [0,1]
-    nu = _log_normalize(df_metrics["unique_users"])  # in [0,1]
-
-    scoreH = _harmonic_mean(na, nu)
-    diversity = df_metrics["diversity"].astype(float).clip(0.0, 1.0)
-    # Diversity-aware penalty with floor alpha
-    score = scoreH * (alpha + (1.0 - alpha) * diversity)
-
-    out = df_metrics.copy()
-    out["n_messages_log_norm"] = na.values
-    out["n_unique_users_log_norm"] = nu.values
-    out["scoreH"] = scoreH.values
-    out["score"] = score.values
-    return out
-
-
-# --------------------------------------------------------------------------------------
-# Enrichment (optional)
-# --------------------------------------------------------------------------------------
-
-def _maybe_enrich_with_registry(
-    df_ranked: pd.DataFrame,
-    bucket: Optional[str],
-    user_email: Optional[str],
-    verbose: bool = False,
-) -> pd.DataFrame:
-    """Attempt to enrich each agent with name/owner via s3_base.AgentManager.
-    Falls back gracefully if not available or if lookups fail.
-    """
-    if not (AGENT_REGISTRY_AVAILABLE and bucket and user_email):
-        if verbose:
-            print("[ENRICH] Registry not available or bucket/user not provided. Skipping.")
-        df_ranked["agent_name"] = df_ranked.index.astype(str)
-        df_ranked["owner_email"] = None
-        return df_ranked
-
+def safe_read_yaml(path: Path) -> dict:
     try:
-        am = AgentManager(bucket=bucket, user_mail=user_email)
-    except Exception as e:
-        if verbose:
-            print(f"[ENRICH] Failed to init AgentManager: {e}. Skipping enrichment.")
-        df_ranked["agent_name"] = df_ranked.index.astype(str)
-        df_ranked["owner_email"] = None
-        return df_ranked
-
-    names = []
-    owners = []
-    for agent_id in df_ranked.index.astype(str):
-        name = agent_id
-        owner = None
-        try:
-            ag = am.get_agent(agent_id)
-            if hasattr(ag, "nome_agente") and isinstance(ag.nome_agente, str):
-                name = ag.nome_agente
-            try:
-                owner = am.get_agent_owner(agent_id)
-            except Exception:
-                owner = None
-        except Exception:
-            pass
-        names.append(name)
-        owners.append(owner)
-
-    df_ranked["agent_name"] = names
-    df_ranked["owner_email"] = owners
-    return df_ranked
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
 
 
-# --------------------------------------------------------------------------------------
-# Main compute
-# --------------------------------------------------------------------------------------
+def normalize_email(s: str) -> str:
+    return (s or "").strip().lower()
 
-def _load_all_csvs(logs_dir: Path, verbose: bool = False) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    paths = sorted(Path(logs_dir).glob("*.csv"))
-    if not paths:
-        raise FileNotFoundError(f"No CSV files found in {logs_dir}")
 
-    dfs = []
-    counts = {"files": 0, "with_model_col": 0, "without_model_col": 0}
+def normalize_name(s: str) -> str:
+    return " ".join((s or "").split()).strip()
 
-    for p in paths:
-        df = _read_csv_robust(p)
-        counts["files"] += 1
-        if df["model"].isna().all():
-            counts["without_model_col"] += 1
+
+def email_to_username(email: str) -> str:
+    if not email:
+        return ""
+    local = str(email).split("@", 1)[0]
+    for sep in [".", "-", "_", "+"]:
+        local = local.replace(sep, " ")
+    toks = [t for t in local.split() if t]
+    def cap(tok: str) -> str:
+        return tok.upper() if len(tok) == 1 else tok[0].upper() + tok[1:].lower()
+    return " ".join(cap(t) for t in toks)
+
+
+def scan_agents(root: Path, visibilities: Iterable[str], verbose: bool=False) -> pd.DataFrame:
+    rows: List[AgentRow] = []
+    for vis in visibilities:
+        if vis not in VALID_VISIBILITIES:
+            continue
+        vis_dir = root / vis
+        if not vis_dir.exists():
+            if verbose:
+                print(f"[WARN] Visibility dir missing: {vis_dir}")
+            continue
+        for owner_dir in sorted(vis_dir.glob("*/")):
+            owner = normalize_email(owner_dir.name)
+            for yml in sorted(owner_dir.glob("*.yaml")):
+                Y = safe_read_yaml(yml)
+                ag_id = (Y.get("agent_id") or Y.get("id") or Y.get("id_agente") or yml.stem or "").strip()
+                ag_nm = (Y.get("agent_name") or Y.get("nome_agente") or Y.get("name") or "").strip()
+                pr    = Y.get("prompt") or ""
+                tmp   = Y.get("temp", Y.get("temperature", 0.0))
+                try:
+                    tmp = float(tmp)
+                except Exception:
+                    tmp = 0.0
+                rows.append(AgentRow(
+                    id=ag_id,
+                    name=normalize_name(ag_nm),
+                    owner=owner,
+                    prompt=str(pr),
+                    temperature=tmp,
+                    visibility=vis,
+                ))
+    df = pd.DataFrame([r.__dict__ for r in rows])
+    if verbose:
+        print(f"[AGENTS] Loaded {len(df)} agents from {list(visibilities)}")
+    return df
+
+# ----------------------- Logs load + prep ------------------------------
+
+def load_and_prepare_logs(logs_dir: Path, decay: float, verbose: bool=False) -> Tuple[pd.DataFrame, Dict[str,int]]:
+    csvs = sorted(logs_dir.glob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No CSV logs in {logs_dir}")
+    DF = pd.concat([read_csv_robust(p) for p in csvs], ignore_index=True)
+    DF["timestamp"] = parse_timestamp_col(DF)
+    DF, drop_stats = policy_filter(DF, verbose=verbose)
+    DF = standardize_strings(DF)
+    bad_ts = DF["timestamp"].isna()
+    if bad_ts.any():
+        drop_stats["dropped_invalid_timestamp"] = int(bad_ts.sum())
+        DF = DF.loc[~bad_ts]
+    DF = add_recency_weight(DF, decay)
+    if verbose:
+        print(f"[LOGS] Rows after filters: {len(DF)} | users={DF['user'].nunique()} | agents={DF['selected_agent'].nunique()} | models={DF['model'].nunique()}")
+    return DF, drop_stats
+
+# -------------------------- Metrics & scoring -------------------------
+
+def match_rows_for_agent(df_logs: pd.DataFrame, ag: pd.Series) -> pd.DataFrame:
+    mask_id = df_logs["selected_agent"].str.casefold() == ag["id"].casefold()
+    if mask_id.any():
+        return df_logs.loc[mask_id]
+    mask_nm = df_logs["selected_agent"].str.casefold() == ag["name"].casefold()
+    return df_logs.loc[mask_nm]
+
+
+def compute_agent_metrics(df_rows: pd.DataFrame) -> Tuple[float, int, float, float, Optional[str]]:
+    if df_rows is None or len(df_rows) == 0:
+        return 0.0, 0, 1.0, 0.0, None
+    messages = float(df_rows["w"].sum())
+    unique_users = int(df_rows["user"].nunique())
+    per_user_w = df_rows.groupby("user")["w"].sum()
+    tot = float(per_user_w.sum())
+    if tot <= 0.0:
+        hhi = 1.0
+    else:
+        shares = (per_user_w / tot).astype(float)
+        hhi = float((shares**2).sum())
+    diversity = max(0.0, min(1.0, 1.0 - hhi))
+    # dominant model
+    counts = df_rows.groupby("model").size().sort_values(ascending=False)
+    if len(counts) == 0:
+        dominant_model = None
+    else:
+        topc = counts.iloc[0]
+        tops = counts[counts == topc].index.tolist()
+        if len(tops) == 1:
+            dominant_model = str(tops[0])
         else:
-            counts["with_model_col"] += 1
-        dfs.append(df)
-
-    big = pd.concat(dfs, ignore_index=True)
-    if verbose:
-        print("[LOAD] CSV stats:")
-        print(json.dumps(counts, indent=2))
-        print(f"[LOAD] Total rows raw: {len(big)}")
-    return big, counts
+            latest = df_rows.groupby("model")["timestamp"].max()
+            dominant_model = str(latest.loc[tops].idxmax())
+    return messages, unique_users, hhi, diversity, dominant_model
 
 
-def _prepare_dataframe(df: pd.DataFrame, decay: float, verbose: bool = False) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    df = df.copy()
-    df["timestamp"] = _parse_timestamp_col(df)
-
-    # Apply filters BEFORE converting to strings to avoid turning NaN into literal 'nan'
-    df, drop_stats = _policy_filter(df, verbose=verbose)
-
-    # Standardize strings (now that rows are valid)
-    df = _standardize_strings(df)
-
-    # Remove rows with invalid timestamp after filtering (rare)
-    invalid_ts = df["timestamp"].isna()
-    if invalid_ts.any():
-        drop_stats["dropped_invalid_timestamp"] = int(invalid_ts.sum())
-        df = df.loc[~invalid_ts]
-
-    # Recency weight
-    df = _add_recency_weight(df, decay)
-
-    if verbose:
-        print(f"[CLEAN] Rows after all filters: {len(df)}")
-    return df, drop_stats
+def log_normalize(s: pd.Series) -> pd.Series:
+    maxv = float(s.max()) if len(s) else 0.0
+    if maxv <= 0.0:
+        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
+    return np.log1p(s.astype(float)) / math.log1p(maxv)
 
 
-def _compute_leaderboard(
-    df: pd.DataFrame,
-    alpha: float,
-    topk: int,
-    session_gap_mins: int = 0,
-    bucket: Optional[str] = None,
-    user_email: Optional[str] = None,
-    verbose: bool = False,
-) -> pd.DataFrame:
-    metrics = _aggregate_agent_metrics(df, session_gap_mins=session_gap_mins, verbose=verbose)
+def score_agents(df_metrics: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    na = log_normalize(df_metrics["messages"])  # [0,1]
+    nu = log_normalize(df_metrics["unique_users"])  # [0,1]
+    scoreH = (2.0*na*nu)/(na+nu) ; scoreH[(na+nu)==0.0] = 0.0
+    div = df_metrics["diversity"].astype(float).clip(0,1)
+    score = scoreH * (alpha + (1.0 - alpha) * div)
+    return df_metrics.assign(scoreH=scoreH, score=score)
 
-    # Drop invalid/placeholder agent IDs that may still remain
-    invalid_idx = (
-        metrics.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
-    )
-    metrics = metrics.loc[~invalid_idx]
+# -------------------------- Iara-only generator -----------------------
 
-    scored = _score_agents(metrics, alpha=alpha)
-    ranked = scored.sort_values("score", ascending=False)
-    ranked = _maybe_enrich_with_registry(ranked, bucket=bucket, user_email=user_email, verbose=verbose)
+class IaraOnlyDescriptionGenerator:
+    """Wrapper around mrm_copilot.core.agents.Agent.
 
-    # Final guard: drop any rows whose index (agent_id) is empty/None/NaN-like
-    final_invalid = ranked.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
-    ranked = ranked.loc[~final_invalid]
-
-    return ranked.head(topk)
-
-
-def _emit_json(df_ranked: pd.DataFrame, out_path: Path, include_model: Optional[str] = None) -> None:
-    """Emit JSON with only the requested fields:
-    ["agent_name", "messages", "unique_users", "hhi", "diversity", "score"].
-    Also drops any rows with invalid/placeholder agent IDs.
+    - Uses a fixed **Portuguese** system prompt (template + instructions).
+    - Sends the agent's YAML prompt as the **content**.
+    - Retries on transient errors and sleeps between calls to be polite.
+    - No heuristic fallback. If it fails, returns a placeholder string.
     """
-    # Ensure agent_name exists; fallback to index
-    out_df = df_ranked.copy()
-    if "agent_name" not in out_df.columns:
-        out_df["agent_name"] = out_df.index.astype(str)
+    def __init__(self, model: str, retries: int = 2, sleep_s: float = 0.6, verbose: bool = False):
+        self.model = model
+        self.retries = max(0, int(retries))
+        self.sleep_s = max(0.0, float(sleep_s))
+        self.verbose = verbose
+        try:
+            from mrm_copilot.core.agents import Agent  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"Falha ao importar IaraGenAI Agent: {e}")
 
-    # Filter out invalid agent ids
-    valid_idx = ~out_df.index.to_series().astype(str).str.strip().str.lower().isin(["", "nan", "none", "null"])
-    out_df = out_df.loc[valid_idx]
+        system_prompt = (
+            "Gere UMA única frase em português (<= 240 caracteres), seguindo o modelo: "
+            "'Este agente é especializado em [resumo da tarefa]. Deve ser usado quando você precisar [objetivo do usuário], "
+            "atuando como [persona]. Use este agente para [como/quando usar, com base nas entradas do usuário].' "
+            "Reformule com suas próprias palavras; NÃO copie trechos do prompt. Mantenha tom profissional."
+        )
+        try:
+            self.agent = Agent(prompt=system_prompt, temperature=0, client="IaraGenAi", model=self.model)
+        except Exception as e:
+            raise RuntimeError(f"Falha ao instanciar IaraGenAI Agent: {e}")
 
-    final_cols = ["agent_name", "messages", "unique_users", "hhi", "diversity", "score"]
+    def summarize(self, agent_prompt: str) -> str:
+        text = (agent_prompt or "").strip()
+        last_err = None
+        for attempt in range(self.retries + 1):
+            try:
+                ans = self.agent.interaction(content=text, memory=False, return_type="string")
+                if self.sleep_s:
+                    time.sleep(self.sleep_s)
+                ans = (ans or "").strip()
+                if ans:
+                    return ans
+            except Exception as e:
+                last_err = e
+                if self.verbose:
+                    print(f"[IARA] tentativa {attempt+1} falhou: {e}")
+                if self.sleep_s:
+                    time.sleep(self.sleep_s)
+        # Sem fallback heurístico
+        return "Descrição indisponível (falha na geração pelo Iara)."
 
-    # Build records
-    records = []
-    for _, row in out_df.iterrows():
-        rec = {col: row[col] for col in final_cols if col in out_df.columns}
-        # normalize NaN/inf to None where applicable
-        for k, v in list(rec.items()):
-            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                rec[k] = None
-        records.append(rec)
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
-
-
-# --------------------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------------------
+# ------------------------------- Main ---------------------------------
 
 def main() -> None:
-    args = _parse_args()
+    args = parse_args()
+    agents_root = Path(args.agents_root)
     logs_dir = Path(args.logs_dir)
     out_dir = Path(args.out_dir)
-    _ensure_out_dir(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load
-    df_raw, load_stats = _load_all_csvs(logs_dir, verbose=args.verbose)
+    visibilities = [v for v in args.visibilities if v in VALID_VISIBILITIES]
+    if not visibilities:
+        raise ValueError("No valid visibilities specified (use: public, private)")
 
-    # Prepare
-    df, drop_stats = _prepare_dataframe(df_raw, decay=args.decay, verbose=args.verbose)
+    # 1) Scan YAML agents
+    df_agents = scan_agents(agents_root, visibilities, verbose=args.verbose)
+    if df_agents.empty:
+        raise RuntimeError("No agents found under the specified visibilities.")
+    df_agents["username"] = df_agents["owner"].apply(email_to_username)
 
-    if args.verbose:
-        print("[META] After filtering:")
-        print(f"       unique agents: {df['selected_agent'].nunique()}")
-        print(f"       unique users : {df['user'].nunique()}")
-        print(f"       unique models: {df['model'].nunique()}")
+    # 2) Load and prepare logs
+    df_logs, drop_stats = load_and_prepare_logs(logs_dir, decay=args.decay, verbose=args.verbose)
 
-    # Overall leaderboard (all models mixed)
-    top_overall = _compute_leaderboard(
-        df,
-        alpha=args.alpha,
-        topk=args.topk,
-        session_gap_mins=args.session_gap_mins,
-        bucket=args.bucket,
-        user_email=args.user_email,
+    # 3) Compute metrics and dominant model
+    metrics_store = {"id": [], "messages": [], "unique_users": [], "hhi": [], "diversity": []}
+    dominant_model_map: Dict[str, Optional[str]] = {}
+
+    for _, ag in df_agents.iterrows():
+        rows = match_rows_for_agent(df_logs, ag)
+        messages, unique_users, hhi, diversity, dom_model = compute_agent_metrics(rows)
+        metrics_store["id"].append(ag["id"])
+        metrics_store["messages"].append(messages)
+        metrics_store["unique_users"].append(unique_users)
+        metrics_store["hhi"].append(hhi)
+        metrics_store["diversity"].append(diversity)
+        dominant_model_map[ag["id"]] = dom_model
+
+    df_metrics = pd.DataFrame(metrics_store).set_index("id")
+
+    # 4) Score computation (global or per-folder)
+    if args.score_scope == "per-folder":
+        parts = []
+        for _, ids in df_agents.groupby("visibility")["id"]:
+            parts.append(score_agents(df_metrics.loc[ids.values], alpha=args.alpha))
+        df_scores = pd.concat(parts, axis=0)
+    else:
+        df_scores = score_agents(df_metrics, alpha=args.alpha)
+
+    # 5) Join static fields + dominant model
+    df_join = df_agents.set_index("id").join(df_scores, how="left")
+    df_join["model"] = df_join.index.map(dominant_model_map.get)
+
+    # 6) Descriptions via IaraGenAI (without any heuristics)
+    iara = IaraOnlyDescriptionGenerator(
+        model=args.iara_model,
+        retries=args.iara_retries,
+        sleep_s=args.iara_sleep,
         verbose=args.verbose,
     )
-    _emit_json(top_overall, out_dir / "recommendations_top10_overall.json")
+    df_join["description"] = df_join["prompt"].apply(lambda p: iara.summarize(str(p)))
 
-    # Per-model leaderboards
-    if args.per_model:
-        for model, dfm in df.groupby("model"):
-            top_m = _compute_leaderboard(
-                dfm,
-                alpha=args.alpha,
-                topk=args.topk,
-                session_gap_mins=args.session_gap_mins,
-                bucket=args.bucket,
-                user_email=args.user_email,
-                verbose=args.verbose,
-            )
-            safe_model = str(model).replace(os.sep, "_").replace(" ", "_")
-            _emit_json(top_m, out_dir / f"recommendations_top10_model={safe_model}.json", include_model=str(model))
+    # 7) Emit per-visibility JSONs
+    diagnostics = {
+        "drops": drop_stats,
+        "n_agents": int(len(df_agents)),
+        "n_logs": int(len(df_logs)),
+        "score_scope": args.score_scope,
+        "iara_model": args.iara_model,
+        "iara_only": True,
+    }
 
-    # Diagnostics dump
+    for vis in visibilities:
+        sub = df_join[df_join["visibility"] == vis].copy()
+        records: List[Dict[str, object]] = []
+        for _, row in sub.iterrows():
+            rec = {
+                "description": row.get("description"),
+                "id": row.name,
+                "name": row.get("name") or None,
+                "owner": row.get("owner") or None,
+                "username": row.get("username") or None,
+                "score": None if pd.isna(row.get("score")) else float(row.get("score")),
+                "visibility": row.get("visibility") or None,
+                "model": row.get("model") or None,
+                "prompt": row.get("prompt") or None,
+                "temperature": None if pd.isna(row.get("temperature")) else float(row.get("temperature")),
+            }
+            # sanitize score/temperature edge cases
+            for k in ("score", "temperature"):
+                v = rec[k]
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    rec[k] = None
+            records.append(rec)
+        out_path = Path(args.out_dir) / f"agents_enriched_{vis}.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        if args.verbose:
+            print(f"[WRITE] {out_path} → {len(records)} agents")
+
+    # 8) Diagnostics
+    diag_path = Path(args.out_dir) / "agents_enriched_diagnostics.json"
+    with open(diag_path, "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
     if args.verbose:
-        diag = {
-            "load": load_stats,
-            "drops": drop_stats,
-            "final_rows": int(len(df)),
-        }
-        with open(out_dir / "diagnostics.json", "w", encoding="utf-8") as f:
-            json.dump(diag, f, indent=2)
-        print("[DONE] Wrote:")
-        print("  - recommendations_top10_overall.json")
-        if args.per_model:
-            print("  - recommendations_top10_model=*.json")
-        print("  - diagnostics.json")
+        print(f"[WRITE] {diag_path}")
 
 
 if __name__ == "__main__":
