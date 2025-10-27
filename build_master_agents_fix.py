@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fix for missing agent names in master JSON.
------------------------------------------
-This version ensures that if the 'name' field is null after merging, the script
-tries to recover the agent name from the group-level data. Specifically:
-- If an agent appears in exactly one group, its name is set to that group name.
-- If multiple groups contain the same agent, we leave 'name' as-is (to avoid ambiguity).
+Fixed version of build_master_agents_fix.py.
+--------------------------------------------
+Removes the unnecessary imports from build_master_agents that caused:
+    ImportError: cannot import name 'norm_email' from 'build_master_agents'
 
-Usage:
-    python build_master_agents_fixed.py \
-        --enriched-dir results_enriched \
-        --groups-dir results_groups \
-        --out-dir results_master \
-        --verbose
+This script simply loads agents_master.json, infers missing names from
+shared_with group names, and saves agents_master_fixed.json.
 """
 
 import json
 from pathlib import Path
-from collections import Counter
-from build_master_agents import main as original_main, norm_email, email_to_username
 
 def main():
-    # We reuse the full logic of build_master_agents, then patch names after loading.
     import argparse
     parser = argparse.ArgumentParser(description="Fix missing agent names in master JSON.")
-    parser.add_argument("--enriched-dir", required=True)
-    parser.add_argument("--groups-dir", required=True)
-    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--out-dir", required=True, help="Directory containing agents_master.json")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
