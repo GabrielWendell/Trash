@@ -1,50 +1,80 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fixed version of build_master_agents_fix.py.
---------------------------------------------
-Removes the unnecessary imports from build_master_agents that caused:
-    ImportError: cannot import name 'norm_email' from 'build_master_agents'
+Master JSON post-processor (v2)
+===============================
+- Fills missing agent `name` from the single group label (if exactly one).
+- Flattens `shared_with` so it becomes just a list of emails (union across all groups).
 
-This script simply loads agents_master.json, infers missing names from
-shared_with group names, and saves agents_master_fixed.json.
+Input : <out-dir>/agents_master.json
+Output: <out-dir>/agents_master_fixed.json
+
+Usage:
+    python build_master_agents_fix_v2.py --out-dir results_master --verbose
 """
-
 import json
 from pathlib import Path
 
+
+def _flatten_shared_with(shared_with):
+    """shared_with may be a dict {group_name: [emails]}. Return flat, deduped list.
+    If it's already a list, normalize & dedupe. If None/other → empty list.
+    """
+    flat = []
+    if isinstance(shared_with, dict):
+        for members in shared_with.values():
+            if isinstance(members, list):
+                flat.extend(members)
+    elif isinstance(shared_with, list):
+        flat = list(shared_with)
+    # Normalize emails: strip + lowercase; drop empties
+    normed = []
+    for m in flat:
+        if not isinstance(m, str):
+            continue
+        s = m.strip().lower()
+        if s:
+            normed.append(s)
+    # Dedup + sort
+    return sorted(set(normed))
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Fix missing agent names in master JSON.")
-    parser.add_argument("--out-dir", required=True, help="Directory containing agents_master.json")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Fix names and flatten shared_with in agents_master.json")
+    ap.add_argument("--out-dir", required=True, help="Directory containing agents_master.json")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
 
-    out_master = Path(args.out_dir) / "agents_master.json"
-    if not out_master.exists():
-        raise FileNotFoundError(f"Master file not found: {out_master}")
+    out_dir = Path(args.out_dir)
+    in_path = out_dir / "agents_master.json"
+    if not in_path.exists():
+        raise FileNotFoundError(f"Master file not found: {in_path}")
 
-    # Load master JSON
-    with open(out_master, "r", encoding="utf-8") as f:
-        master = json.load(f)
+    with open(in_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    # Fix missing names
     fixed = []
-    for rec in master:
+    filled_from_group = 0
+    for rec in data:
+        # 1) Fill name from a single group label if missing
         if (not rec.get("name")) and isinstance(rec.get("shared_with"), dict):
-            group_names = list(rec["shared_with"].keys())
-            if len(group_names) == 1:
-                rec["name"] = group_names[0]
+            keys = list(rec["shared_with"].keys())
+            if len(keys) == 1:
+                rec["name"] = keys[0]
+                filled_from_group += 1
+        # 2) Flatten shared_with to a list of emails
+        rec["shared_with"] = _flatten_shared_with(rec.get("shared_with"))
         fixed.append(rec)
 
-    # Save fixed master
-    fixed_master = Path(args.out_dir) / "agents_master_fixed.json"
-    with open(fixed_master, "w", encoding="utf-8") as f:
+    out_path = out_dir / "agents_master_fixed.json"
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(fixed, f, ensure_ascii=False, indent=2)
 
     if args.verbose:
         null_names = sum(1 for r in fixed if not r.get("name"))
-        print(f"[INFO] Saved {fixed_master} (agents={len(fixed)}, still null names={null_names})")
+        print(f"[OK] Wrote {out_path} | agents={len(fixed)} | names_filled={filled_from_group} | still_null_names={null_names}")
+
 
 if __name__ == "__main__":
     main()
