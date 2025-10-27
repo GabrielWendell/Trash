@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EVA Agents → Enriched JSON (Public/Private) with usernames + IaraGenAI descriptions
-=================================================================================
+EVA Agents → Enriched JSON (Public/Private) **ONLY IaraGenAI descriptions**
+===========================================================================
 
 This script scans agents in `public/` and `private/`, cross-matches with EVA
 logs to compute engagement metrics and a recommendation score, and emits
@@ -11,18 +11,20 @@ per-visibility JSON files with the following fields per agent:
     description, id, name, owner, username, score, visibility, model,
     prompt, temperature
 
-**New**: Uses Itaú's internal LLM (IaraGenAI) via `mrm_copilot.core.agents.Agent`
-with a fixed system prompt to generate the description from each agent's YAML
-prompt. If Iara is unavailable or fails, we fall back to a robust heuristic
-summarizer (no external calls).
+⚠️ Important: **No heuristic summarizer is used.** Descriptions are generated
+**exclusively** by Itaú's internal LLM via `mrm_copilot.core.agents.Agent`
+(IaraGenAI). If Iara is unavailable or returns an empty string, the script will
+record a placeholder message indicating the failure; it will NOT fall back to
+any heuristic.
 
 Example:
-    python enrich_agents_username.py \
+    python enrich_agents_IaraGenAI.py \
       --agents-root "ChatBots Files/s3_agents_download" \
       --logs-dir logs_csv \
       --out-dir results_enriched \
       --visibilities public private \
       --alpha 0.15 --decay 0.0 --score-scope global \
+      --iara-model gpt-4.1-2025-04-14 --iara-sleep 0.6 --iara-retries 2 \
       --verbose
 """
 from __future__ import annotations
@@ -30,7 +32,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +44,7 @@ import yaml
 # ----------------------------- CLI ------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Enrich EVA agents by cross-matching YAMLs with logs (IaraGenAI descriptions)")
+    p = argparse.ArgumentParser(description="Enrich EVA agents (IaraGenAI-only descriptions, no heuristics)")
     p.add_argument("--agents-root", required=True, type=str,
                    help="Root path containing public/ and private/ subfolders")
     p.add_argument("--logs-dir", required=True, type=str,
@@ -55,10 +56,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decay", type=float, default=0.0, help="Recency exponential decay per day (0 disables)")
     p.add_argument("--score-scope", choices=["global", "per-folder"], default="global",
                    help="Score normalization across all selected folders or per folder")
-    p.add_argument("--use-iara", action="store_true", help="Use IaraGenAI to generate descriptions (fallback to heuristic if it fails)")
+    # Iara controls
     p.add_argument("--iara-model", type=str, default="gpt-4.1-2025-04-14", help="IaraGenAI model name")
-    p.add_argument("--iara-retries", type=int, default=2, help="Retries per description when Iara throttles/errors")
-    p.add_argument("--iara-sleep", type=float, default=0.6, help="Seconds to sleep between Iara calls to be polite")
+    p.add_argument("--iara-sleep", type=float, default=0.6, help="Seconds to sleep between Iara calls")
+    p.add_argument("--iara-retries", type=int, default=2, help="Retries per description on transient errors")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -279,155 +280,56 @@ def score_agents(df_metrics: pd.DataFrame, alpha: float) -> pd.DataFrame:
     score = scoreH * (alpha + (1.0 - alpha) * div)
     return df_metrics.assign(scoreH=scoreH, score=score)
 
-# ---------------- IaraGenAI + heuristic description generator ---------
+# -------------------------- Iara-only generator -----------------------
 
-class HeuristicSummarizer:
-    """Pure heuristic template-based description generator (no LLM)."""
-    BASE_VERBS = {
-        "write": "writing", "generate": "generating", "create": "creating",
-        "summarize": "summarizing", "classify": "classifying", "extract": "extracting",
-        "analyze": "analyzing", "analyse": "analyzing", "evaluate": "evaluating",
-        "compute": "computing", "forecast": "forecasting", "predict": "predicting",
-        "plan": "planning", "draft": "drafting", "format": "formatting",
-        "translate": "translating", "validate": "validating", "compare": "comparing",
-        "document": "documenting", "assist": "assisting", "help": "helping",
-        "explain": "explaining", "review": "reviewing", "refactor": "refactoring",
-        "debug": "debugging", "query": "querying", "visualize": "visualizing",
-    }
-    RE_ROLE = re.compile(r"\b(?:you are|you're|act as|role\s*[:=])\s*(.+?)(?:[\.;\n]|$)", re.I)
-    RE_GOAL = re.compile(r"\b(?:goal|objective|purpose|mission|task)\s*[:=]\s*(.+?)(?:[\.;\n]|$)", re.I)
-    RE_TO_VERB   = re.compile(r"\bto\s+([a-z]{3,})([^\.;\n]*)", re.I)
-    RE_WILL_VERB = re.compile(r"\bwill\s+(?:be\s+)?([a-z]{3,})(?:ing\b)?([^\.;\n]*)", re.I)
-    RE_VERB_ING  = re.compile(r"\b([a-z]{3,})ing\b([^\.;\n]*)", re.I)
+class IaraOnlyDescriptionGenerator:
+    """Wrapper around mrm_copilot.core.agents.Agent.
 
-    def _clean(self, s: str) -> str:
-        s = " ".join((s or "").split())
-        s = re.sub(r"^(?:an?|the)\s+", "", s, flags=re.I)
-        return s
-
-    def _to_gerund(self, v: str) -> str:
-        v = v.lower()
-        return self.BASE_VERBS.get(v, v + ("ing" if not v.endswith("e") else "ing"))
-
-    def _persona(self, prompt: str) -> str:
-        m = self.RE_ROLE.search(prompt)
-        return self._clean(m.group(1)) if m else "a helpful assistant"
-
-    def _compose(self, verb: str, tail: str) -> str:
-        ger = self._to_gerund(verb)
-        tail = self._clean(tail)
-        tail = re.split(r"\b(?:that|which|who|so that|in order to)\b", tail, 1, flags=re.I)[0]
-        words = [w for w in tail.split() if w]
-        tail = " ".join(words[:12])
-        return (ger + (" " + tail if tail else "")).strip()
-
-    def _tasks(self, prompt: str) -> List[str]:
-        tasks: List[str] = []
-        used = set()
-        for rgx in (self.RE_TO_VERB, self.RE_WILL_VERB, self.RE_VERB_ING):
-            for m in rgx.finditer(prompt):
-                v = m.group(1)
-                if len(v) < 3 or v.lower() in used:
-                    continue
-                used.add(v.lower())
-                tail = m.group(2) if m.lastindex and m.lastindex >= 2 else ""
-                tasks.append(self._compose(v, tail))
-                if len(tasks) >= 2:
-                    break
-            if len(tasks) >= 2:
-                break
-        if tasks:
-            return tasks
-        # fallback: cleaned first sentence, sans "you are/you will"
-        first = re.split(r"[\.!?\n]", prompt, maxsplit=1)[0]
-        first = re.sub(r"\b(?:you are|you're|you will|your task is|role\s*[:=])\b\s*", "", first, flags=re.I)
-        first = self._clean(first)
-        return [first] if first else ["executing the tasks described in its prompt"]
-
-    def _goal(self, prompt: str) -> str:
-        m = self.RE_GOAL.search(prompt)
-        if m:
-            return self._clean(m.group(1))
-        m = re.search(r"\bso that\s+([^\.;\n]+)", prompt, re.I)
-        if m:
-            return self._clean(m.group(1))
-        m = re.search(r"\bin order to\s+([^\.;\n]+)", prompt, re.I)
-        if m:
-            return self._clean(m.group(1))
-        m = self.RE_TO_VERB.search(prompt)
-        if m:
-            return self._clean((m.group(1) + " " + (m.group(2) or "")).strip())
-        return "reach your desired outcome"
-
-    def _how(self, prompt: str) -> str:
-        if re.search(r"\b(minute|minutes|document|report|agenda|memo|note)\b", prompt, re.I):
-            return "provide context and any required structure/templates so it can format documents correctly"
-        if re.search(r"\b(audit|auditor|compliance|regulator|risk)\b", prompt, re.I):
-            return "share case details and criteria so it can draft compliant, reviewable text"
-        if re.search(r"\b(sql|query|database|dataset|table|schema|csv|excel)\b", prompt, re.I):
-            return "state questions and constraints; include sample rows/schemas if relevant"
-        return "provide the necessary context and constraints for precise, actionable outputs"
-
-    def summarize(self, prompt: str) -> str:
-        persona = self._persona(prompt)
-        task = "; ".join(self._tasks(prompt))
-        goal = self._goal(prompt)
-        how = self._how(prompt)
-        return (
-            f"This agent specializes in {task}. "
-            f"It should be used when you need {goal}, acting as {persona}. "
-            f"Use this agent to {how}."
-        )
-
-
-class IaraDescriptionGenerator:
-    """Wrapper around mrm_copilot.core.agents.Agent with retries and fallback."""
-    def __init__(self, enabled: bool, model: str, retries: int, sleep_s: float, verbose: bool=False):
-        self.enabled = enabled
+    - Uses a fixed **Portuguese** system prompt (template + instructions).
+    - Sends the agent's YAML prompt as the **content**.
+    - Retries on transient errors and sleeps between calls to be polite.
+    - No heuristic fallback. If it fails, returns a placeholder string.
+    """
+    def __init__(self, model: str, retries: int = 2, sleep_s: float = 0.6, verbose: bool = False):
         self.model = model
         self.retries = max(0, int(retries))
         self.sleep_s = max(0.0, float(sleep_s))
         self.verbose = verbose
-        self.agent = None
-        self.heur = HeuristicSummarizer()
-        if self.enabled:
-            try:
-                from mrm_copilot.core.agents import Agent  # type: ignore
-                system_prompt = (
-                    "This agent specializes in [task summary]. It should be used when you need [user goal], "
-                    "acting as [persona]. Use this agent to [brief explanation of how and when to use it, based on user responses].\n"
-                    "Given the following agent prompt, output exactly ONE sentence following the template above. "
-                    "Do NOT copy the original wording; paraphrase into the template, keep <= 220 characters, no labels."
-                )
-                self.agent = Agent(prompt=system_prompt, temperature=0, client="IaraGenAi", model=self.model)
-                self.ok = True
-            except Exception as e:
-                if self.verbose:
-                    print(f"[IARA] Disabled (init error): {e}")
-                self.ok = False
-        else:
-            self.ok = False
+        try:
+            from mrm_copilot.core.agents import Agent  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"Falha ao importar IaraGenAI Agent: {e}")
+
+        system_prompt = (
+            "Gere UMA única frase em português (<= 240 caracteres), seguindo o modelo: "
+            "'Este agente é especializado em [resumo da tarefa]. Deve ser usado quando você precisar [objetivo do usuário], "
+            "atuando como [persona]. Use este agente para [como/quando usar, com base nas entradas do usuário].' "
+            "Reformule com suas próprias palavras; NÃO copie trechos do prompt. Mantenha tom profissional."
+        )
+        try:
+            self.agent = Agent(prompt=system_prompt, temperature=0, client="IaraGenAi", model=self.model)
+        except Exception as e:
+            raise RuntimeError(f"Falha ao instanciar IaraGenAI Agent: {e}")
 
     def summarize(self, agent_prompt: str) -> str:
-        p = (agent_prompt or "").strip()
-        if not self.ok or not self.agent:
-            return self.heur.summarize(p)
+        text = (agent_prompt or "").strip()
         last_err = None
         for attempt in range(self.retries + 1):
             try:
-                ans = self.agent.interaction(content=p, memory=False, return_type="string")
+                ans = self.agent.interaction(content=text, memory=False, return_type="string")
+                if self.sleep_s:
+                    time.sleep(self.sleep_s)
                 ans = (ans or "").strip()
                 if ans:
                     return ans
             except Exception as e:
                 last_err = e
                 if self.verbose:
-                    print(f"[IARA] attempt {attempt+1} failed: {e}")
+                    print(f"[IARA] tentativa {attempt+1} falhou: {e}")
                 if self.sleep_s:
                     time.sleep(self.sleep_s)
-        if self.verbose and last_err is not None:
-            print(f"[IARA] Falling back to heuristic after error: {last_err}")
-        return self.heur.summarize(p)
+        # Sem fallback heurístico
+        return "Descrição indisponível (falha na geração pelo Iara)."
 
 # ------------------------------- Main ---------------------------------
 
@@ -480,9 +382,8 @@ def main() -> None:
     df_join = df_agents.set_index("id").join(df_scores, how="left")
     df_join["model"] = df_join.index.map(dominant_model_map.get)
 
-    # 6) Descriptions via IaraGenAI (with heuristic fallback)
-    iara = IaraDescriptionGenerator(
-        enabled=args.use_iara,
+    # 6) Descriptions via IaraGenAI (without any heuristics)
+    iara = IaraOnlyDescriptionGenerator(
         model=args.iara_model,
         retries=args.iara_retries,
         sleep_s=args.iara_sleep,
@@ -496,8 +397,8 @@ def main() -> None:
         "n_agents": int(len(df_agents)),
         "n_logs": int(len(df_logs)),
         "score_scope": args.score_scope,
-        "iara_enabled": bool(args.use_iara),
-        "iara_model": args.iara_model if args.use_iara else None,
+        "iara_model": args.iara_model,
+        "iara_only": True,
     }
 
     for vis in visibilities:
