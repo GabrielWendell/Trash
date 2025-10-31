@@ -234,6 +234,12 @@ def main() -> None:
         rec["owner"] = norm_email(rec.get("owner"))
         if not rec.get("username") and rec.get("owner"):
             rec["username"] = email_to_username(rec["owner"])
+        # NEW: name fallback from single group label
+        if (not rec.get("name")) and isinstance(rec.get("shared_with"), dict) and len(rec["shared_with"]) == 1:
+            try:
+                rec["name"] = next(iter(rec["shared_with"].keys()))
+            except Exception:
+                pass
 
     # Emit master and diagnostics
     master = sorted(base.values(), key=lambda x: (x.get("visibility") or "zzz", x.get("name") or "", x.get("id") or ""))
