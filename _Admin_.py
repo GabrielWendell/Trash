@@ -1,6 +1,6 @@
 elif opcao == 'Criar Agentes (JSON)':
     import json, uuid, math, os, tempfile, traceback
-    from dataclasses import make_dataclass, is_dataclass
+    from dataclasses import make_dataclass, is_dataclass, field
     import streamlit as st
 
     # resolve manager from session
@@ -67,7 +67,12 @@ elif opcao == 'Criar Agentes (JSON)':
             p["score"] = float(s) if s not in (None, "", "nan", "NaN") else 0.0
         except Exception:
             p["score"] = 0.0
+        # ensure list
+        sw = p.get("shared_with")
+        if not isinstance(sw, list):
+            p["shared_with"] = []
         return p
+
 
     def _safe_call(method_name, *args, **kwargs):
         fn = getattr(mgr, method_name, None)
@@ -92,11 +97,19 @@ elif opcao == 'Criar Agentes (JSON)':
                 ("model", str), ("prompt", str), ("description", str), ("temperature", float),
             ])
         if IndexModelCls is None:
-            IndexModelCls = make_dataclass("IndexModelDyn", [
-                ("id", str), ("name", str), ("visibility", str),
-                ("owner_name", str), ("owner_email", str), ("description", str),
-                ("score", float),
-            ])
+            IndexModelCls = make_dataclass(
+                "IndexModelDyn",
+                [
+                    ("id", str),
+                    ("name", str),
+                    ("visibility", str),
+                    ("owner_name", str),
+                    ("owner_email", str),
+                    ("description", str),
+                    ("score", float),
+                    ("shared_with", list, field(default_factory=list)),  # <-- NEW
+                ],
+            )
         return AgentModelCls, IndexModelCls
 
     def _harden_manager_paths_generic(m):
@@ -179,14 +192,26 @@ elif opcao == 'Criar Agentes (JSON)':
                 prog.progress(min(100, int(i*100/total))); continue
 
             agent_payload = _sanitize_agent_payload({
-                'id': agent_id, 'name': name, 'slug': slug, 'tools': [],
-                'model': model, 'prompt': prompt, 'description': description, 'temperature': temperature,
+                'id': agent_id, 
+                'name': name, 
+                'slug': slug, 
+                'tools': [],
+                'model': model, 
+                'prompt': prompt, 
+                'description': description, 
+                'temperature': temperature,
             })
             index_payload = _sanitize_index_payload({
-                'id': agent_id, 'name': name, 'visibility': visibility,
-                'owner_name': username, 'owner_email': owner_email,
-                'description': description, 'score': r.get('score'),
+                "id": agent_id,
+                "name": name,
+                "visibility": visibility,
+                "owner_name": username,
+                "owner_email": owner_email,
+                "description": description,
+                "score": r.get("score"),
+                "shared_with": shared_with,            # <-- NEW
             })
+
 
             # build dataclasses (manager calls dataclasses.asdict inside)
             try:
