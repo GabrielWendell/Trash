@@ -21,9 +21,6 @@ opcao = st.selectbox('Escolha uma opção:', ('', 'Dashboard', 'Logs', 'Feedback
 # 2) Novo ramo do menu
 # ===================== Criar Agentes (JSON) — FIXED BRANCH =====================
 elif opcao == 'Criar Agentes (JSON)':
-    import json, uuid, math, time
-    import streamlit as st
-
     # OPTIONAL: import pydantic models if available (falls back to dicts)
     try:
         from create_agent import AgentModel  # type: ignore
