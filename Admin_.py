@@ -2,7 +2,7 @@
 # This version works around the 'dict has no attribute id' issue.
 # It dynamically converts dicts into lightweight objects with attribute access.
 
-elif opcao == 'Criar Agentes (JSON)':
+elif opcao == 'Converter Agentes (JSON)':
     from dataclasses import make_dataclass, is_dataclass
     import json, uuid, math, types
     import streamlit as st
@@ -193,6 +193,7 @@ elif opcao == 'Criar Agentes (JSON)':
 
         # Harden manager attrs so os.path.join(...) never sees None
         _harden_manager_paths(mgr)
+        #st.written(mgr)
 
         created = skipped = errors = partial = 0
         resultados = []
@@ -216,7 +217,7 @@ elif opcao == 'Criar Agentes (JSON)':
                                    'msg': 'campos obrigatórios ausentes: ' + ", ".join(missing)})
                 prog.progress(min(100, int(i*100/total))); continue
 
-            agent_id = (r.get('id') or '').strip() or str(uuid.uuid4())
+            agent_id = str(uuid.uuid4())
             description  = (r.get('description') or '').strip()
             temperature  = _clamp(r.get('temperature'), 0.0, 1.0, 0.0)
             visibility   = r.get('visibility') or 'Privado'
@@ -296,6 +297,9 @@ elif opcao == 'Criar Agentes (JSON)':
             created += 1
             resultados.append({'name': name, 'owner': owner_email, 'status': 'ok', 'msg': '', 'agent_id': agent_id})
             prog.progress(min(100, int(i*100/total)))
+
+        #st.written(agent_obj)
+        #st.written(index_obj)
 
         st.success(f'Concluído: criados={created}, pulados={skipped}, parciais={partial}, erros={errors}')
         st.dataframe(resultados)
