@@ -223,9 +223,3 @@ elif opcao == 'Criar Agentes (JSON)':
         st.success(f'Concluído: criados={created}, pulados={skipped}, parciais={partial}, erros={errors}')
         st.dataframe(resultados)
 # =================== /Criar Agentes (JSON) — FIXED BRANCH ======================
-
-
-            prog.progress(min(100, int(i*100/len(data))))
-
-        st.success(f'Concluído: criados={created}, pulados={skipped}, erros={errors}')
-        st.dataframe(resultados)
