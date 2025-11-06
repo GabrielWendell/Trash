@@ -4,16 +4,6 @@ from ema.core.utils import slugify  # type: ignore
 import streamlit as st
 import json, uuid, math
 
-# --- HELPER(S) ---
-def _clamp(x, lo=0.0, hi=1.0, default=0.0):
-    try:
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return max(lo, min(hi, v))
-    except Exception:
-        return default
-
 # >>>>>>>>>>>>>>>>>>>>>  BLOCO DO MENU  <<<<<<<<<<<<<<<<<<<<<<
 # 1) Acrescente a opção no selectbox existente
 opcao = st.selectbox('Escolha uma opção:', ('', 'Dashboard', 'Logs', 'Feedback', 'Limpeza de Logs', 'Criar Agentes (JSON)'))
