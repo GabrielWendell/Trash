@@ -1,4 +1,4 @@
-elif opcao == 'Atualizar Pontuações (Logs)':
+elif opcao == 'Atualizar Scores (Logs)':
     import json
     import math
     from pathlib import Path
@@ -7,19 +7,20 @@ elif opcao == 'Atualizar Pontuações (Logs)':
     import pandas as pd
     import yaml
 
-    st.subheader("Atualizar pontuação de agentes a partir dos logs de acesso")
+    st.subheader("Atualizar scores de agentes a partir dos logs de acesso")
 
-    # ⚙️ Controles adicionais
-    col_a, col_b = st.columns([1, 1])
+    col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
         alpha = st.number_input("Peso de diversidade (alpha)", 0.0, 1.0, 0.15, 0.01)
     with col_b:
         dry_run_scores = st.checkbox("Dry run (não salvar no index.yaml)", value=True)
+    with col_c:
+        debug_logs = st.checkbox("Mostrar debug dos logs", value=True)
 
-    # Helpers internos --------------------------------------------------
+    # ------------------ Helpers internos ------------------ #
 
     def _df_from_log_text(text: str) -> pd.DataFrame:
-        """Converte o conteúdo do .log (JSONL) em DataFrame, parecido com parse_logs.load_data."""
+        """Converte o conteúdo do .log (JSONL) em DataFrame (similar ao parse_logs)."""
         rows = []
         for i, line in enumerate(text.splitlines(), 1):
             s = line.strip()
@@ -42,22 +43,41 @@ elif opcao == 'Atualizar Pontuações (Logs)':
         return df
 
     def _standardize(df: pd.DataFrame) -> pd.DataFrame:
+        # deixa tudo em lower/strip para evitar variações de texto
         df["user"] = df["user"].astype(str).str.strip().str.lower()
         df["page"] = df["page"].astype(str).str.strip().str.lower()
         df["selected_agent"] = df["selected_agent"].astype(str).str.strip()
         df["model"] = df["model"].astype(str).str.strip()
         return df
 
-    def _policy_filter(df: pd.DataFrame) -> pd.DataFrame:
-        # (i) remove page == "landing"
-        df = df[df["page"] != "landing"]
-        # (ii) remove selected_agent vazios / NaN
-        mask_sel = df["selected_agent"].astype(str).str.strip().isin(["", "nan", "none", "null"])
-        df = df[~mask_sel]
-        # (iii) remove model vazios / NaN
-        mask_mod = df["model"].astype(str).str.strip().isin(["", "nan", "none", "null"])
-        df = df[~mask_mod]
-        return df
+    def _empty_like(s: pd.Series) -> pd.Series:
+        """Detecção de 'vazio' no mesmo estilo dos outros scripts."""
+        s_str = s.astype(str).str.strip().str.lower()
+        return s.isna() | s_str.isin(["", "nan", "none", "null"])
+
+    def _policy_filter(df: pd.DataFrame):
+        """Aplica filtros + devolve stats para debug."""
+        stats = {}
+        n0 = len(df)
+
+        # (i) remover page == 'landing'
+        mask = df["page"] == "landing"
+        stats["dropped_landing"] = int(mask.sum())
+        df = df.loc[~mask]
+
+        # (ii) remover selected_agent inválido
+        mask = _empty_like(df["selected_agent"])
+        stats["dropped_selected_agent_invalid"] = int(mask.sum())
+        df = df.loc[~mask]
+
+        # (iii) remover model inválido
+        mask = _empty_like(df["model"])
+        stats["dropped_model_invalid"] = int(mask.sum())
+        df = df.loc[~mask]
+
+        stats["kept_after_filters"] = int(len(df))
+        stats["dropped_total"] = int(n0 - len(df))
+        return df, stats
 
     def _log_normalize(s: pd.Series) -> pd.Series:
         maxv = float(s.max()) if len(s) else 0.0
@@ -65,45 +85,62 @@ elif opcao == 'Atualizar Pontuações (Logs)':
             return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
         return np.log1p(s.astype(float)) / math.log1p(maxv)
 
-    # -------------------------------------------------------------------
+    # ------------------ Ação do botão ------------------ #
 
     if st.button("Baixar logs, calcular scores e atualizar index.yaml", type="primary"):
-        # 1️⃣ Baixar logs no intervalo de datas
+        # 1) Baixar logs
         st.info("Baixando logs a partir do EVA Logger…")
         content = eva_logger.download_logs(start_date=start_date, end_date=end_date)
         if not content:
             st.error("Nenhum log retornado para o intervalo selecionado.")
             st.stop()
 
-        # 2️⃣ Converter conteúdo dos logs em DataFrame
+        # 2) Converter para DataFrame
         st.info("Convertendo logs para DataFrame…")
         df = _df_from_log_text(content)
         req_cols = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
         df = _ensure_cols(df, req_cols)
         df = _standardize(df)
 
-        # 3️⃣ Aplicar filtros de política
+        if debug_logs:
+            st.markdown("### Debug — DataFrame bruto")
+            st.write(f"Linhas totais (bruto): {len(df)}")
+            st.write("Colunas:", list(df.columns))
+            st.write("Amostra (head):")
+            st.dataframe(df.head(50))
+            st.write("value_counts(page):")
+            st.write(df["page"].value_counts(dropna=False))
+            st.write("value_counts(selected_agent):")
+            st.write(df["selected_agent"].value_counts(dropna=False).head(20))
+            st.write("value_counts(model):")
+            st.write(df["model"].value_counts(dropna=False))
+
+        # 3) Filtros
         st.info("Aplicando filtros (page!='landing', selected_agent/model válidos)…")
-        df = _policy_filter(df)
+        df, filt_stats = _policy_filter(df)
+
+        if debug_logs:
+            st.markdown("### Debug — Após filtros")
+            st.write("Stats dos filtros:", filt_stats)
+            st.write(f"Linhas restantes: {len(df)}")
+            st.dataframe(df.head(50))
+
         if df.empty:
             st.warning("Após os filtros, nenhum log restante. Nada a atualizar.")
             st.stop()
 
-        # 4️⃣ Calcular métricas por agente --------------------------------
+        # 4) Métricas e scores
         st.info("Calculando métricas e scores por agente…")
 
         records = []
         grouped = df.groupby("selected_agent", dropna=True)
 
-        # métricas brutas
         for ag_name, g in grouped:
             messages = float(len(g))
             unique_users = int(g["user"].nunique())
-
             per_user = g["user"].value_counts(normalize=True)
             hhi = float((per_user ** 2).sum()) if len(per_user) else 1.0
             diversity = max(0.0, min(1.0, 1.0 - hhi))
-
             records.append(
                 {
                     "name": ag_name,
@@ -120,7 +157,6 @@ elif opcao == 'Atualizar Pontuações (Logs)':
 
         df_metrics = pd.DataFrame(records)
 
-        # normalização logarítmica
         na = _log_normalize(df_metrics["messages"])
         nu = _log_normalize(df_metrics["unique_users"])
         scoreH = (2.0 * na * nu) / (na + nu)
@@ -132,7 +168,6 @@ elif opcao == 'Atualizar Pontuações (Logs)':
         df_metrics["scoreH"] = scoreH
         df_metrics["score"] = score
 
-        # Mapa nome → score
         score_map = {
             str(row["name"]).strip().lower(): float(row["score"])
             for _, row in df_metrics.iterrows()
@@ -140,10 +175,7 @@ elif opcao == 'Atualizar Pontuações (Logs)':
 
         st.success(f"Scores calculados para {len(score_map)} agentes distintos.")
 
-        # 5️⃣ Carregar index.yaml e fazer XMatch ---------------------------
-        st.info("Carregando index.yaml e atualizando scores…")
-
-        # caminho padrão: ../../mock_bucket/ema/index/index.yaml
+        # 5) Carregar e atualizar index.yaml (mesmo código de antes) ---- #
         index_path = Path(__file__).resolve().parents[3] / "mock_bucket" / "ema" / "index" / "index.yaml"
         if not index_path.exists():
             st.error(f"Arquivo index.yaml não encontrado em: {index_path}")
@@ -184,7 +216,6 @@ elif opcao == 'Atualizar Pontuações (Logs)':
                 }
             )
 
-        # 6️⃣ Salvar index.yaml (se não for dry-run) -----------------------
         if not dry_run_scores:
             with open(index_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(index_data, f, allow_unicode=True, sort_keys=False)
@@ -192,5 +223,4 @@ elif opcao == 'Atualizar Pontuações (Logs)':
         else:
             st.info(f"Dry run ativado: {updated} agentes seriam atualizados (index.yaml não foi modificado).")
 
-        # 7️⃣ Mostrar tabela com resumo das alterações ---------------------
         st.dataframe(pd.DataFrame(rows_view))
