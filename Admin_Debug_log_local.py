@@ -17,18 +17,15 @@ elif opcao == 'Atualizar Scores (Logs)':
     with col_c:
         debug_logs = st.checkbox("Mostrar debug dos logs", value=True)
     with col_d:
-        use_local_logs = st.checkbox("Usar log local (CSV)", value=False)
+        use_local_logs = st.checkbox("Usar log local (arquivo .log)", value=False)
 
-    # caminho padrão do CSV local (../../../../Backup/data/logs_csv/...)
-    local_csv_path = (
-        Path(__file__).resolve().parents[4]
-        / "Backup"
-        / "data"
-        / "logs_csv"
-        / "logs-2025-11-14-15-00-55.csv"
-    )
+    # Se for usar log local, deixa o usuário enviar o arquivo
+    uploaded_log = None
     if use_local_logs:
-        st.caption(f"Log local: {local_csv_path}")
+        uploaded_log = st.file_uploader(
+            "Envie um arquivo de log (.log / .txt / .jsonl)",
+            type=["log", "txt", "jsonl"],
+        )
 
     # ------------------ Helpers internos ------------------ #
 
@@ -42,6 +39,7 @@ elif opcao == 'Atualizar Scores (Logs)':
             try:
                 obj = json.loads(s)
             except json.JSONDecodeError:
+                # pula linhas quebradas
                 continue
             if not isinstance(obj, dict):
                 obj = {"value": obj}
@@ -97,12 +95,12 @@ elif opcao == 'Atualizar Scores (Logs)':
     if st.button("Baixar logs, calcular scores e atualizar index.yaml", type="primary"):
         # 1) Obter logs
         if use_local_logs:
-            st.info(f"Lendo log local CSV: {local_csv_path}")
-            if not local_csv_path.exists():
-                st.error(f"Arquivo CSV local não encontrado em: {local_csv_path}")
+            if uploaded_log is None:
+                st.error("Envie um arquivo de log antes de processar.")
                 st.stop()
-            # CSV já convertido (parse_logs.py); lê direto
-            df = pd.read_csv(local_csv_path, engine="python", dtype=str)
+            st.info("Lendo log local enviado…")
+            content = uploaded_log.read().decode("utf-8", errors="replace")
+            df = _df_from_log_text(content)
         else:
             st.info("Baixando logs a partir do EVA Logger…")
             content = eva_logger.download_logs(start_date=start_date, end_date=end_date)
@@ -111,14 +109,19 @@ elif opcao == 'Atualizar Scores (Logs)':
                 st.stop()
             df = _df_from_log_text(content)
 
-        # 2) Garantir colunas e padronizar
+        # 2) Garantir colunas mínimas e padronizar
         st.info("Convertendo logs para DataFrame…")
         req_cols = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
         df = _ensure_cols(df, req_cols)
+
+        # Remove a coluna 'message' para evitar problemas com textos enormes
+        if "message" in df.columns:
+            df = df.drop(columns=["message"])
+
         df = _standardize(df)
 
         if debug_logs:
-            st.markdown("### Debug — DataFrame bruto")
+            st.markdown("### Debug — DataFrame bruto (após remover 'message')")
             st.write(f"Linhas totais (bruto): {len(df)}")
             st.write("Colunas:", list(df.columns))
             st.write("Amostra (head):")
@@ -190,7 +193,7 @@ elif opcao == 'Atualizar Scores (Logs)':
 
         st.success(f"Scores calculados para {len(score_map)} agentes distintos.")
 
-        # 5) Atualizar index.yaml (mesmo que antes)
+        # 5) Atualizar index.yaml
         index_path = Path(__file__).resolve().parents[3] / "mock_bucket" / "ema" / "index" / "index.yaml"
         if not index_path.exists():
             st.error(f"Arquivo index.yaml não encontrado em: {index_path}")
