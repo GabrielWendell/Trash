@@ -30,7 +30,7 @@ elif opcao == "Atualizar Scores (Logs)":
             if origem_logs == "Baixar logs do EVA":
                 st.write("📥 Baixando logs a partir do EVA Logger...")
                 content = eva_logger.download_logs(start_date, end_date)
-                logs_text = content.decode("utf-8")
+                logs_text = content
 
             else:
                 if uploaded_log is None:
