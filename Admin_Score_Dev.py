@@ -1,198 +1,126 @@
-# ============================================================
-#  OPTION: Atualizar Scores (Logs)
-# ============================================================
-
 elif opcao == "Atualizar Scores (Logs)":
-
     st.subheader("Atualizar scores de agentes a partir dos logs de acesso")
 
-    # ----------------------------------------------------------------------
-    # Parameters
-    # ----------------------------------------------------------------------
-    alpha = st.number_input("Peso de diversidade (alpha)", 0.0, 1.0, 0.15, 0.01)
-    dry_run = st.checkbox("Dry run (não salvar no index.yaml)", value=True)
+    alpha = st.number_input("Peso da diversidade (alpha)", min_value=0.0, max_value=1.0,
+                            value=0.15, step=0.01)
 
-    st.markdown("### Escolha a origem dos logs")
-    log_mode = st.radio(
-        "Selecione:",
-        ["Baixar logs do EVA", "Enviar arquivo .log local"]
+    dry_run = st.checkbox("Dry run (não salvar no index.yaml)", value=True)
+    debug = st.checkbox("Debug")
+
+    origem_logs = st.radio(
+        "Escolha a origem dos logs",
+        ("Baixar logs do EVA", "Enviar arquivo .log local")
     )
 
-    # ======================================================================
-    #  Helper Functions
-    # ======================================================================
+    uploaded_log = None
+    if origem_logs == "Enviar arquivo .log local":
+        uploaded_log = st.file_uploader("Envie um arquivo .log", type=["log"])
 
-    REQUIRED_COLS = [
-        "timestamp", "user", "page", "message",
-        "__line__", "type", "selected_agent", "model"
-    ]
+    st.markdown("---")
 
-    def df_from_log_text(text: str) -> pd.DataFrame:
-        """
-        Convert EVA raw log text (JSON lines) into a DataFrame.
-        """
-        import json
+    # Only run when the user clicks the button
+    if st.button("Executar atualização de scores"):
+        try:
+            st.info("Iniciando processo...")
+            logs_text = ""
 
-        rows = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                rows.append(obj)
-            except Exception:
-                continue
-        return pd.DataFrame(rows)
+            # ---------------------------------------------------------
+            # 1. Load logs
+            # ---------------------------------------------------------
+            if origem_logs == "Baixar logs do EVA":
+                st.write("📥 Baixando logs a partir do EVA Logger...")
+                content = eva_logger.download_logs(start_date, end_date)
+                logs_text = content.decode("utf-8")
 
-    # ----------------------------------------------------------
-
-    def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-        for c in REQUIRED_COLS:
-            if c not in df.columns:
-                df[c] = np.nan
-        return df[REQUIRED_COLS]
-
-    # ----------------------------------------------------------
-
-    def standardize(df):
-        df["user"] = df["user"].astype(str).str.strip().str.lower()
-        df["selected_agent"] = df["selected_agent"].astype(str).str.strip()
-        df["page"] = df["page"].astype(str).str.strip().str.lower()
-        df["model"] = df["model"].astype(str).str.strip()
-        return df
-
-    # ----------------------------------------------------------
-
-    def filter_policy(df):
-        m1 = df["page"] != "landing"
-        m2 = df["selected_agent"].notna() & (df["selected_agent"].str.len() > 0)
-        m3 = df["model"].notna() & (df["model"].str.len() > 0)
-        return df[m1 & m2 & m3]
-
-    # ----------------------------------------------------------
-
-    def log_normalize(series: pd.Series) -> pd.Series:
-        maxv = float(series.max()) if len(series) else 0
-        if maxv <= 0:
-            return pd.Series(np.zeros(len(series)), index=series.index)
-        return np.log1p(series) / np.log1p(maxv)
-
-    # ----------------------------------------------------------
-
-    def compute_scores(df, alpha):
-        """
-        Returns:
-            dict[name_lower → score]
-        """
-        groups = df.groupby("selected_agent")
-
-        score_map = {}
-
-        for ag, g in groups:
-            w_sum = g.shape[0]
-            u_users = g["user"].nunique()
-
-            # Diversity
-            per_user = g.groupby("user").size()
-            tot = per_user.sum()
-            if tot <= 0:
-                diversity = 0
             else:
-                shares = per_user / tot
-                hhi = (shares**2).sum()
-                diversity = max(0, min(1, 1 - hhi))
+                if uploaded_log is None:
+                    st.error("Você deve enviar um arquivo .log primeiro.")
+                    st.stop()
 
-            # ScoreH
-            na = log_normalize(pd.Series({"x": w_sum})).iloc[0]
-            nu = log_normalize(pd.Series({"x": u_users})).iloc[0]
+                st.write("📥 Convertendo arquivo enviado...")
+                logs_text = uploaded_log.read().decode("utf-8")
 
-            denom = na + nu
-            if denom <= 0:
-                scoreH = 0
-            else:
-                scoreH = 2 * na * nu / denom
+            # ---------------------------------------------------------
+            # 2. Convert LOG → CSV DataFrame
+            # ---------------------------------------------------------
+            st.write("🔄 Convertendo logs para DataFrame...")
+            df = parse_log_text_to_dataframe(logs_text)
 
-            score = scoreH * (alpha + (1 - alpha) * diversity)
+            if "message" in df.columns:
+                df = df.drop(columns=["message"])
 
-            score_map[ag.strip().lower()] = float(score)
+            if debug:
+                st.write("DataFrame original:")
+                st.dataframe(df.head())
 
-        return score_map
+            # ---------------------------------------------------------
+            # 3. Apply filters
+            # ---------------------------------------------------------
+            st.write("🔍 Aplicando filtros...")
+            df_filt = df[
+                (df["page"] != "landing") &
+                (df["selected_agent"].notna()) &
+                (df["model"].notna())
+            ]
 
-    # ======================================================================
-    #  Read Logs
-    # ======================================================================
+            if debug:
+                st.write("Após filtros:")
+                st.dataframe(df_filt.head())
 
-    if log_mode == "Baixar logs do EVA":
-        st.info("Baixando logs a partir do EVA Logger…")
-        logs_text = eva_logger.download_logs(start_date=start_date, end_date=end_date)
+            if df_filt.empty:
+                st.warning("Após os filtros, nenhum log restante. Nada a atualizar.")
+                st.stop()
 
-    else:  # enviar arquivo local (.log)
-        uploaded = st.file_uploader("Envie um arquivo .log", type=["log"])
-        if uploaded is None:
-            st.stop()
+            # ---------------------------------------------------------
+            # 4. Compute scores
+            # ---------------------------------------------------------
+            st.write("📊 Calculando scores...")
+            scores = compute_scores_from_df(df_filt, alpha)
 
-        logs_text = uploaded.read().decode("utf-8", errors="ignore")
+            if debug:
+                st.write("Scores calculados:")
+                st.json(scores)
 
-    # ======================================================================
-    # Convert logs → DataFrame
-    # ======================================================================
-    st.info("Convertendo logs para DataFrame…")
-    df_raw = df_from_log_text(logs_text)
-    df_raw = ensure_columns(df_raw)
-    df_raw = standardize(df_raw)
+            # ---------------------------------------------------------
+            # 5. Update index.yaml using MultiAgentManager
+            # ---------------------------------------------------------
+            user_email = st.session_state.get("user_email", "unknown@itau-unibanco.com.br")
+            bucket = settings.S3_BUCKET  # adjust to match your project
 
-    # ======================================================================
-    # Filter
-    # ======================================================================
-    st.info("Aplicando filtros…")
-    df_filt = filter_policy(df_raw)
+            st.write("📁 Inicializando MultiAgentManager...")
+            mgr = MultiAgentManager(bucket=bucket, user_email=user_email)
 
-    if df_filt.empty:
-        st.warning("Após filtros, nenhum log restante.")
-        st.stop()
+            updates_done = 0
+            missing = 0
 
-    # ======================================================================
-    # Compute Scores
-    # ======================================================================
-    st.info("Calculando scores…")
-    score_map = compute_scores(df_filt, alpha)
+            for agent_name, sc in scores.items():
+                agent_found = False
 
-    # ======================================================================
-    #  Load MultiAgentManager
-    # ======================================================================
-    from ema.core.s3_agent_manager import MultiAgentManager
-    mgr = MultiAgentManager()
+                index_list = mgr.load_index()
+                if index_list is None:
+                    st.error("Erro: index.yaml não pôde ser carregado.")
+                    st.stop()
 
-    # ======================================================================
-    # Patch Function
-    # ======================================================================
-    updated = 0
+                # find agent in index.yaml
+                for entry in index_list:
+                    if entry["name"].strip().lower() == agent_name.strip().lower():
+                        agent_found = True
+                        if not dry_run:
+                            mgr.edit_index(entry["id"], {"score": float(sc)})
+                        updates_done += 1
+                        break
 
-    def patch_index(index_list):
-        nonlocal updated
-        for item in index_list:
-            if not isinstance(item, dict):
-                continue
-            name = (item.get("name") or "").strip().lower()
-            if not name:
-                continue
-            if name in score_map:
-                item["score"] = float(score_map[name])
-                updated += 1
-        return index_list
+                if not agent_found:
+                    missing += 1
 
-    # ======================================================================
-    # Apply Update
-    # ======================================================================
-    if dry_run:
-        st.info("Dry run: preview das alterações (não serão salvas).")
-        index_current = mgr.load_index()
-        patched = patch_index(index_current)
+            # ---------------------------------------------------------
+            # 6. Finished
+            # ---------------------------------------------------------
+            st.success(
+                f"Concluído! Atualizados={updates_done}, "
+                f"Não encontrados={missing}, Dry-run={dry_run}"
+            )
 
-        st.success(f"Dry run concluído. {updated} agentes seriam atualizados.")
-        st.dataframe(pd.DataFrame(patched))
-    else:
-        st.info("Atualizando index.yaml…")
-        mgr.edit_index(patch_index)
-        st.success(f"Scores atualizados para {updated} agentes no index.yaml!")
+        except Exception as e:
+            st.error(f"Erro durante a execução: {e}")
+            st.exception(e)
