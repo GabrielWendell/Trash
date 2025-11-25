@@ -5,10 +5,14 @@ elif opcao == "Atualizar Scores (Logs)":
     col1, col2, col3 = st.columns(3)
     with col1:
         alpha = st.number_input(
-            "Peso de diversidade (alpha)", min_value=0.0, max_value=1.0, value=0.15, step=0.01
+            "Peso de diversidade (alpha)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.15,
+            step=0.01,
         )
     with col2:
-        dry_run = st.checkbox("Dry run (não salvar index.yaml)", value=True)
+        dry_run = st.checkbox("Dry run (não salvar no index.yaml)", value=True)
     with col3:
         debug = st.checkbox("Debug", value=False)
 
@@ -20,7 +24,9 @@ elif opcao == "Atualizar Scores (Logs)":
 
     uploaded_file = None
     if origem_logs == "Enviar arquivo .log local":
-        uploaded_file = st.file_uploader("Envie um arquivo .log (JSON lines)", type=["log", "txt"])
+        uploaded_file = st.file_uploader(
+            "Envie um arquivo .log (JSON lines)", type=["log", "txt"]
+        )
 
     st.markdown("---")
 
@@ -29,8 +35,11 @@ elif opcao == "Atualizar Scores (Logs)":
 
         # 1) Obter texto de logs
         if origem_logs == "Baixar logs do EVA":
-            st.info("📥 Baixando logs do EVA Logger…")
-            content = eva_logger.download_logs(start_date=start_date, end_date=end_date)
+            st.info("📥 Baixando logs a partir do EVA Logger…")
+            content = eva_logger.download_logs(
+                start_date=start_date, end_date=end_date
+            )
+            # content pode ser bytes ou str dependendo do logger
             if isinstance(content, bytes):
                 logs_text = content.decode("utf-8", errors="replace")
             else:
@@ -47,7 +56,15 @@ elif opcao == "Atualizar Scores (Logs)":
         df_raw = parse_log_text_to_dataframe(logs_text)
 
         # Garante colunas mínimas
-        needed_cols = ["timestamp", "user", "page", "__line__", "type", "selected_agent", "model"]
+        needed_cols = [
+            "timestamp",
+            "user",
+            "page",
+            "__line__",
+            "type",
+            "selected_agent",
+            "model",
+        ]
         for c in needed_cols:
             if c not in df_raw.columns:
                 df_raw[c] = np.nan
@@ -65,7 +82,7 @@ elif opcao == "Atualizar Scores (Logs)":
             st.write("value_counts(page):")
             st.write(df_raw["page"].value_counts(dropna=False))
 
-        # 3) Filtros de política (landing, NaNs etc.)
+        # 3) Filtros de política
         st.info("🧹 Aplicando filtros de política…")
         mask_valid = (
             (df_raw["page"] != "landing")
@@ -88,7 +105,13 @@ elif opcao == "Atualizar Scores (Logs)":
         st.info("📊 Calculando scores por agente…")
         df_scores = compute_scores_from_df(df_filt, alpha=alpha)
 
-        # Mapa name_lower → score
+        # Remove linhas cujo selected_agent é NaN ou string vazia
+        df_scores = df_scores[
+            df_scores["selected_agent"].notna()
+            & (df_scores["selected_agent"].astype(str).str.strip() != "")
+        ].copy()
+
+        # Mapa agent_name (lower) → score
         score_map = {
             str(row["selected_agent"]).strip().lower(): float(row["score"])
             for _, row in df_scores.iterrows()
@@ -98,19 +121,23 @@ elif opcao == "Atualizar Scores (Logs)":
             st.markdown("#### Scores calculados")
             st.dataframe(df_scores)
 
-        # 5) Obter o MultiAgentManager já configurado
-        #    IMPORTANTE: reusar o mesmo objeto que você já usa em outras abas/admin.
-        #    Ajuste a chave de session_state conforme o seu código real.
-        mgr = st.session_state.get("agent_manager") or st.session_state.get("multi_agent_manager")
+        # 5) Obter o manager já usado no app
+        mgr = (
+            st.session_state.get("multi_agent_manager")
+            or st.session_state.get("agent_manager")
+        )
+
         if mgr is None:
-            st.error(
-                "MultiAgentManager não encontrado em st.session_state "
-                "(chaves tentadas: 'agent_manager', 'multi_agent_manager').\n\n"
-                "Reutilize aqui o mesmo manager que você usa para criar/editar agentes."
+            st.warning(
+                "Nenhum manager encontrado em st.session_state "
+                "(chaves tentadas: 'multi_agent_manager', 'agent_manager').\n"
+                "Os scores foram calculados, mas o index.yaml não será atualizado."
             )
             st.stop()
 
-        # 6) Atualizar index.yaml via função de edição
+        has_index_api = hasattr(mgr, "load_index") and hasattr(mgr, "edit_index")
+
+        # 6) Função de patch que será aplicada ao index.yaml
         updated = 0
         preview_rows = []
 
@@ -149,37 +176,48 @@ elif opcao == "Atualizar Scores (Logs)":
 
             return index_list
 
-        # Dry run: apenas faz patch em memória
-        if dry_run:
-            st.info("🔍 Dry run: simulando atualização de scores (nada será salvo).")
-            try:
-                # assumindo que o manager possui método load_index()
-                index_current = mgr.load_index()
-                if index_current is None:
-                    st.error("mgr.load_index() retornou None.")
-                    st.stop()
-                _ = patch_index(index_current)
-                st.success(f"Dry run concluído. {updated} agentes seriam atualizados.")
-            except Exception as e:
-                st.error(f"Erro ao carregar/patch index em dry run: {e}")
-                st.stop()
+        # 7) Aplicar / simular atualização do index
+        if not has_index_api:
+            # Não quebra: apenas informa que não é possível mexer no index
+            st.warning(
+                "O objeto de manager atual não expõe a API de índice "
+                "(load_index/edit_index). Os scores foram calculados, "
+                "mas o index.yaml não será atualizado automaticamente."
+            )
         else:
-            st.info("💾 Atualizando index.yaml no backend (via MultiAgentManager)…")
-            try:
-                # assumindo que o manager possui método edit_index(fn) que:
-                #  - carrega index
-                #  - aplica fn(index)
-                #  - salva resultado
-                mgr.edit_index(patch_index)
-                st.success(f"Scores atualizados para {updated} agentes.")
-            except Exception as e:
-                st.error(f"Erro ao aplicar edit_index: {e}")
-                st.stop()
+            if dry_run:
+                st.info(
+                    "🔍 Dry run: simulando atualização de scores (nada será salvo)."
+                )
+                try:
+                    index_current = mgr.load_index()
+                    if index_current is None:
+                        st.error("mgr.load_index() retornou None.")
+                        st.stop()
+                    _ = patch_index(index_current)
+                    st.success(
+                        f"Dry run concluído. {updated} agentes seriam atualizados."
+                    )
+                except Exception as e:
+                    st.error(f"Erro ao carregar/patch index em dry run: {e}")
+                    st.stop()
+            else:
+                st.info(
+                    "💾 Atualizando index.yaml no backend (via MultiAgentManager)…"
+                )
+                try:
+                    mgr.edit_index(patch_index)
+                    st.success(f"Scores atualizados para {updated} agentes.")
+                except Exception as e:
+                    st.error(f"Erro ao aplicar edit_index: {e}")
+                    st.stop()
 
-        # 7) Mostrar tabela de preview/relatório
+        # 8) Mostrar tabela de preview/relatório
         if preview_rows:
             df_preview = pd.DataFrame(preview_rows)
             st.markdown("#### Resumo das alterações de score")
             st.dataframe(df_preview)
         else:
-            st.info("Nenhum agente no index.yaml foi encontrado nos logs para atualização.")
+            st.info(
+                "Nenhum agente do index.yaml foi encontrado nos logs para atualização."
+            )
