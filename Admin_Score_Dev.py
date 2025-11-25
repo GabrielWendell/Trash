@@ -142,43 +142,60 @@ elif opcao == "Atualizar Scores (Logs)":
         preview_rows = []
 
         def patch_index(index_list):
+            """
+            Atualiza / penaliza scores no index.yaml.
+
+            - Se o agente aparece nos logs → usa score de score_map.
+            - Se NÃO aparece nos logs → penaliza score antigo dividindo por 10.
+            """
             nonlocal updated, preview_rows
 
             for item in index_list:
                 if not isinstance(item, dict):
                     continue
+
                 name_raw = item.get("name") or ""
                 name_norm = name_raw.strip().lower()
                 old_score = item.get("score", 0.0)
 
+                # Normaliza old_score para float
+                try:
+                    old_score_val = float(old_score or 0.0)
+                except Exception:
+                    old_score_val = 0.0
+
                 if name_norm in score_map:
+                    # Agente encontrado nos logs → usa novo score
                     new_score = float(score_map[name_norm])
-                    preview_rows.append(
-                        {
-                            "name": name_raw,
-                            "old_score": old_score,
-                            "new_score": new_score,
-                            "status": "atualizado",
-                        }
-                    )
-                    if not dry_run:
-                        item["score"] = new_score
-                    updated += 1
+                    status = "atualizado_com_logs"
                 else:
-                    preview_rows.append(
-                        {
-                            "name": name_raw,
-                            "old_score": old_score,
-                            "new_score": old_score,
-                            "status": "sem_logs",
-                        }
-                    )
+                    # Agente NÃO apareceu nos logs → penaliza score antigo
+                    if old_score is None:
+                        new_score = 0.0
+                    else:
+                        new_score = old_score_val / 10.0
+                    status = "penalizado_sem_logs"
+
+                preview_rows.append(
+                    {
+                        "name": name_raw,
+                        "old_score": old_score_val,
+                        "new_score": new_score,
+                        "status": status,
+                    }
+                )
+
+                if not dry_run:
+                    item["score"] = new_score
+
+                # Conta qualquer agente que sofreu mudança (atualização ou penalização)
+                if status in ("atualizado_com_logs", "penalizado_sem_logs"):
+                    updated += 1
 
             return index_list
 
         # 7) Aplicar / simular atualização do index
         if not has_index_api:
-            # Não quebra: apenas informa que não é possível mexer no index
             st.warning(
                 "O objeto de manager atual não expõe a API de índice "
                 "(load_index/edit_index). Os scores foram calculados, "
@@ -196,7 +213,8 @@ elif opcao == "Atualizar Scores (Logs)":
                         st.stop()
                     _ = patch_index(index_current)
                     st.success(
-                        f"Dry run concluído. {updated} agentes seriam atualizados."
+                        f"Dry run concluído. {updated} agentes seriam atualizados "
+                        "(incluindo penalizações de agentes sem logs)."
                     )
                 except Exception as e:
                     st.error(f"Erro ao carregar/patch index em dry run: {e}")
@@ -207,7 +225,9 @@ elif opcao == "Atualizar Scores (Logs)":
                 )
                 try:
                     mgr.edit_index(patch_index)
-                    st.success(f"Scores atualizados para {updated} agentes.")
+                    st.success(
+                        f"Scores atualizados/penalizados para {updated} agentes."
+                    )
                 except Exception as e:
                     st.error(f"Erro ao aplicar edit_index: {e}")
                     st.stop()
@@ -219,5 +239,5 @@ elif opcao == "Atualizar Scores (Logs)":
             st.dataframe(df_preview)
         else:
             st.info(
-                "Nenhum agente do index.yaml foi encontrado nos logs para atualização."
+                "Nenhum agente do index.yaml foi encontrado para atualização/penalização."
             )
