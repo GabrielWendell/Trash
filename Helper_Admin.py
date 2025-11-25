@@ -3,6 +3,26 @@ import numpy as np
 import pandas as pd
 
 
+def parse_log_text_to_dataframe(text: str) -> pd.DataFrame:
+    """
+    Converte o conteúdo de um .log (JSON lines) em DataFrame.
+    Supõe um log por linha.
+    """
+    rows = []
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            obj = {"value": obj}
+        obj["__line__"] = i
+        rows.append(obj)
+    return pd.DataFrame(rows)
+
 def _log_normalize(s: pd.Series) -> pd.Series:
     """Log-normalize a positive series to [0, 1]."""
     s = s.astype(float)
