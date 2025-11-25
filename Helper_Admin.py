@@ -1,42 +1,62 @@
-def parse_log_text_to_dataframe(text: str):
-    import json
-    import pandas as pd
-
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-
-    return pd.DataFrame(rows)
-
+import math
 import numpy as np
 import pandas as pd
-import math
+import json
+import streamlit as st
 
-def _log_normalize(series):
-    """Normalize series using log1p scaling."""
+# ------------------------------------------------------
+# Helpers: parsing logs and computing scores
+# ------------------------------------------------------
+
+def parse_log_text_to_dataframe(text: str) -> pd.DataFrame:
+    """
+    Converte o conteúdo de um .log (JSON lines) em DataFrame.
+    Supõe um log por linha.
+    """
+    rows = []
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            obj = {"value": obj}
+        obj["__line__"] = i
+        rows.append(obj)
+    return pd.DataFrame(rows)
+
+
+def _log_normalize(series: pd.Series) -> pd.Series:
+    """Normalização log1p para escalar contagens."""
     maxv = float(series.max()) if len(series) else 0.0
     if maxv <= 0.0:
         return pd.Series(np.zeros(len(series)), index=series.index, dtype=float)
     return np.log1p(series.astype(float)) / math.log1p(maxv)
 
-def compute_scores_from_df(df, alpha=0.15):
+
+def compute_scores_from_df(df: pd.DataFrame, alpha: float = 0.15) -> pd.DataFrame:
     """
-    Compute EVA agent scores from filtered logs dataframe.
-    Expects columns: selected_agent, user, w (recency weight), etc.
+    Calcula score por agente a partir de um DataFrame de logs já filtrado.
+
+    Espera colunas:
+      - selected_agent (str)
+      - user (str)
+      - opcional: w (peso de recência). Se ausente, assume w = 1.0.
     """
-    # Basic aggregation per agent
+    # Garante coluna de peso
+    if "w" not in df.columns:
+        df = df.copy()
+        df["w"] = 1.0
+
     grouped = df.groupby("selected_agent")
 
     messages = grouped["w"].sum()
     unique_users = grouped["user"].nunique()
 
-    # User share distribution → HHI → diversity
+    # Diversidade via HHI (Herfindahl-Hirschman Index)
     shares_dict = {}
     for ag, subdf in grouped:
         per_user = subdf.groupby("user")["w"].sum()
@@ -50,25 +70,25 @@ def compute_scores_from_df(df, alpha=0.15):
     hhi = pd.Series(shares_dict)
     diversity = (1.0 - hhi).clip(0, 1)
 
-    # Normalize interactions and users
+    # Normaliza interações e usuários
     na = _log_normalize(messages)
     nu = _log_normalize(unique_users)
 
-    # Harmonic mean
+    # Média harmônica
     scoreH = (2.0 * na * nu) / (na + nu)
     scoreH[(na + nu) == 0.0] = 0.0
 
-    # Final score
+    # Score final
     score = scoreH * (alpha + (1.0 - alpha) * diversity)
 
-    # Build DataFrame
-    return pd.DataFrame({
-        "selected_agent": messages.index,
-        "messages": messages.values,
-        "unique_users": unique_users.values,
-        "hhi": hhi.values,
-        "diversity": diversity.values,
-        "scoreH": scoreH.values,
-        "score": score.values,
-    })
-
+    return pd.DataFrame(
+        {
+            "selected_agent": messages.index,
+            "messages": messages.values,
+            "unique_users": unique_users.values,
+            "hhi": hhi.values,
+            "diversity": diversity.values,
+            "scoreH": scoreH.values,
+            "score": score.values,
+        }
+    )
