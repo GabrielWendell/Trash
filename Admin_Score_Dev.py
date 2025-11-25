@@ -85,7 +85,7 @@ elif opcao == "Atualizar Scores (Logs)":
             # 5. Update index.yaml using MultiAgentManager
             # ---------------------------------------------------------
             user_email = st.session_state.get("user_email", "unknown@itau-unibanco.com.br")
-            bucket = settings.S3_BUCKET  # adjust to match your project
+            bucket = mgr.bucket  # adjust to match your project
 
             st.write("📁 Inicializando MultiAgentManager...")
             mgr = MultiAgentManager(bucket=bucket, user_email=user_email)
