@@ -46,6 +46,18 @@ def compute_scores_from_df(df: pd.DataFrame, alpha: float = 0.15) -> pd.DataFram
       - user (str)
       - opcional: w (peso de recência). Se ausente, assume w = 1.0.
     """
+    df = df.copy()
+
+    # drop missing or "nan" selected_agent
+    sel = df["selected_agent"].astype(str).str.strip()
+    mask_valid_agent = sel.ne(""). & sel.str.lower().ne("nan")
+    df = df[mask_valid_agent]
+    
+    # drop missing or "nan" model
+    mod = df["model"].astype(str).str.strip()
+    mask_valid_model = mod.ne("") & mod.str.lower().ne("nan")
+    df = df[mask_valid_model]
+    
     # Garante coluna de peso
     if "w" not in df.columns:
         df = df.copy()
