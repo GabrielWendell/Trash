@@ -251,3 +251,26 @@ from datetime import datetime, date
     # sort descending by score so the most used/diverse agents are at the top
     df_scores = df_scores.sort_values("score", ascending=False).reset_index(drop=True)
     return df_scores
+
+# --- helpers for debug display ------------------------------------------------
+
+def _safe_timestamp_to_str(col):
+    """
+    Convert a timestamp-like Series to string without triggering
+    pandas timezone / offset issues.
+
+    We first go through 'object' and Python's str(); if that fails,
+    we fall back to dt.strftime; and as a last resort we use
+    pandas' 'string' dtype.
+    """
+    try:
+        # This forces Python-level conversion, avoiding the tz offset bug
+        return col.astype("object").apply(lambda x: str(x))
+    except Exception:
+        try:
+            # If it really is a datetime Series, we can format it explicitly
+            return col.dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        except Exception:
+            # Last resort: let pandas try, even if it may not be perfect
+            return col.astype("string")
+
