@@ -142,16 +142,6 @@ def convert_logs_text_to_normalized_df(logs_text: str, debug: bool = False) -> p
     return df
 
 
-# -------------------------------------------------------------------
-# UI: datas padrão (exemplo)
-# -------------------------------------------------------------------
-
-def _default_dates():
-    hoje = date.today()
-    return hoje, hoje
-
-
-
 
     
 elif opcao == "Atualizar Scores (Logs)":
@@ -209,10 +199,28 @@ elif opcao == "Atualizar Scores (Logs)":
         df_raw = convert_logs_text_to_normalized_df(logs_text, debug=debug)
 
         if debug:
+            # seção específica sobre o formato dos logs
+            log_fmt = df_raw.attrs.get("log_format", "unknown")
+            conv = bool(df_raw.attrs.get("conversion_applied", False))
+
+            st.markdown("### 📄 Resumo do formato de log utilizado")
+            if log_fmt == "legacy":
+                st.success("Formato detectado: **legado (antigo EVA)**.")
+            elif log_fmt == "ema":
+                st.warning("Formato detectado: **novo/EMA**.")
+            else:
+                st.info(f"Formato detectado: `{log_fmt}` (não identificado explicitamente).")
+
+            if conv:
+                st.info("Uma **conversão EMA → formato legado** foi aplicada antes da análise.")
+            else:
+                st.info("Nenhuma conversão de formato foi necessária (logs já estavam no padrão legado).")
+
             st.markdown("#### DataFrame bruto normalizado")
             st.dataframe(df_raw.head())
             st.write("value_counts(page):")
             st.write(df_raw["page"].value_counts(dropna=False))
+
 
         # -------------------- 3) Filtros de política --------------------
         st.info("🧹 Aplicando filtros de política…")
