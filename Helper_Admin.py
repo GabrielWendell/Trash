@@ -44,47 +44,84 @@ def convert_logs_text_to_normalized_df(logs_text: str, debug: bool = False) -> p
 
         timestamp, user, page, message, __line__, type, selected_agent, model
 
-    A lógica é:
-      - Tenta parsear JSON lines → df_raw.
-      - Se df_raw já tiver todas as colunas esperadas → apenas normaliza.
-      - Caso contrário, tenta inferir colunas usando heurísticas de nome.
-    """
-    df_raw = parse_log_text_to_dataframe(logs_text)
+    Lógica:
+      - parseia JSON lines → df_raw;
+      - se df_raw já tiver todas as colunas esperadas → usa diretamente (formato legado);
+      - caso contrário, tenta inferir colunas de user/model/agent etc. via heurística (formato novo/EMA).
 
+    Além disso, adiciona em df.attrs:
+        df.attrs["log_format"] = "legacy" ou "ema"
+        df.attrs["conversion_applied"] = bool
+    """
+
+    # 1) Parse genérico: JSON por linha
+    rows = []
+    for i, line in enumerate(logs_text.splitlines(), start=1):
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            # Linha não é JSON válido → ignora
+            continue
+        if not isinstance(obj, dict):
+            obj = {"value": obj}
+        obj.setdefault("__line__", i)
+        rows.append(obj)
+
+    if not rows:
+        if debug:
+            st.write("⚠️ Nenhuma linha JSON válida encontrada no log.")
+        cols = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
+        df_empty = pd.DataFrame(columns=cols)
+        df_empty.attrs["log_format"] = "unknown"
+        df_empty.attrs["conversion_applied"] = False
+        return df_empty
+
+    df_raw = pd.DataFrame(rows)
     expected = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
 
-    # Caso trivial: já tem todas as colunas no formato antigo
-    if set(expected).issubset(df_raw.columns):
+    # 2) Detecta formato
+    is_legacy = set(expected).issubset(df_raw.columns)
+
+    if debug:
+        st.markdown("### 🔎 Detecção de formato de log")
+        st.write("Colunas brutas:", list(df_raw.columns))
+        if is_legacy:
+            st.success("Formato detectado: **legado (antigo EVA)**. Nenhuma conversão de formato será aplicada.")
+        else:
+            st.warning("Formato detectado: **novo/EMA**. Será aplicada conversão para o formato legado.")
+
+    # 3) Caso trivial: já está no formato legado
+    if is_legacy:
         df = df_raw.copy()
     else:
-        # Heurística para converter logs "novos" (EMA) em formato legado
+        # 4) Formato "novo"/EMA → heurística de colunas
         if debug:
-            print("♻️ Convertendo logs EMA para formato legado (heurística de colunas)...")
-            print("Colunas disponíveis no df_raw:", list(df_raw.columns))
+            st.write("♻️ Convertendo logs EMA para formato legado (heurística de colunas)...")
 
         df = df_raw.copy()
 
         ts_col    = _find_column_by_substring(df, ["timestamp", "time", "created_at"])
-        user_col  = _find_column_by_substring(df, ["user", "email"])
+        user_col  = _find_column_by_substring(df, ["user", "email", "actor"])
         page_col  = _find_column_by_substring(df, ["page", "screen", "context"])
         msg_col   = _find_column_by_substring(df, ["message", "content", "text"])
         type_col  = _find_column_by_substring(df, ["type", "event_type", "kind"])
-        agent_col = _find_column_by_substring(df, ["selected_agent", "agent", "assistant"])
+        agent_col = _find_column_by_substring(df, ["selected_agent", "agent", "assistant", "bot"])
         model_col = _find_column_by_substring(df, ["model", "llm_model"])
 
         if debug:
-            print("Mapeamento de colunas inferido:")
-            print("  timestamp     ←", ts_col)
-            print("  user          ←", user_col)
-            print("  page          ←", page_col)
-            print("  message       ←", msg_col)
-            print("  type          ←", type_col)
-            print("  selected_agent←", agent_col)
-            print("  model         ←", model_col)
+            st.markdown("#### Mapeamento de colunas inferido")
+            st.write(f"  timestamp      ← {ts_col}")
+            st.write(f"  user           ← {user_col}")
+            st.write(f"  page           ← {page_col}")
+            st.write(f"  message        ← {msg_col}")
+            st.write(f"  type           ← {type_col}")
+            st.write(f"  selected_agent ← {agent_col}")
+            st.write(f"  model          ← {model_col}")
 
         df_norm = pd.DataFrame()
-
-        # preenche colunas básicas
         df_norm["timestamp"]      = df[ts_col]    if ts_col    else np.nan
         df_norm["user"]           = df[user_col]  if user_col  else np.nan
         df_norm["page"]           = df[page_col]  if page_col  else "chat"
@@ -96,17 +133,25 @@ def convert_logs_text_to_normalized_df(logs_text: str, debug: bool = False) -> p
 
         df = df_norm
 
-    # Garante todas as colunas esperadas
+    # 5) Garante todas as colunas esperadas
     for c in expected:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Normalização de tipos / formatação
+    # 6) Normalizações de tipo / formatação
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["user"] = df["user"].astype(str).str.strip().str.lower()
     df["page"] = df["page"].astype(str).str.strip().str.lower()
     df["selected_agent"] = df["selected_agent"].astype(str).str.strip()
     df["model"] = df["model"].astype(str).str.strip()
+
+    # 7) Anotar metadados sobre o formato
+    df.attrs["log_format"] = "legacy" if is_legacy else "ema"
+    df.attrs["conversion_applied"] = (not is_legacy)
+
+    if debug:
+        st.markdown("#### ✅ DataFrame normalizado (formato legado)")
+        st.dataframe(df.head())
 
     return df
 
