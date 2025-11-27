@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import pandas as pd
+from typing import Tuple
 
 def parse_log_text_to_dataframe(logs_text: str) -> pd.DataFrame:
     """
@@ -37,123 +38,128 @@ def _find_column_by_substring(df: pd.DataFrame, substrings) -> str | None:
             return col
     return None
 
-def convert_logs_text_to_normalized_df(logs_text: str, debug: bool = False) -> pd.DataFrame:
+def convert_logs_text_to_normalized_df(logs_text: str, debug: bool = False) -> Tuple[pd.DataFrame, str]:
     """
-    Recebe o texto bruto de logs (.log com JSON lines, possivelmente no formato EMA)
-    e retorna um DataFrame normalizado no formato legado, com colunas:
+    Detect whether logs are in the 'old/legacy EVA' format (flat log lines with
+    timestamp, user, page, message, etc.) or 'new EMA' format (with multi-agent
+    metadata), and always return a normalized DataFrame with the legacy schema:
 
-        timestamp, user, page, message, __line__, type, selected_agent, model
+        ['timestamp', 'user', 'page', '__line__', 'type', 'selected_agent', 'model']
 
-    Lógica:
-      - parseia JSON lines → df_raw;
-      - se df_raw já tiver todas as colunas esperadas → usa diretamente (formato legado);
-      - caso contrário, tenta inferir colunas de user/model/agent etc. via heurística (formato novo/EMA).
-
-    Além disso, adiciona em df.attrs:
-        df.attrs["log_format"] = "legacy" ou "ema"
-        df.attrs["conversion_applied"] = bool
+    This function is UI-agnostic: it does NOT call streamlit.
+    It only returns the DataFrame and a human-readable format label.
     """
+    lines = [ln for ln in logs_text.splitlines() if ln.strip()]
+    if not lines:
+        return pd.DataFrame(columns=[
+            "timestamp", "user", "page", "__line__", "type", "selected_agent", "model"
+        ]), "vazio"
 
-    # 1) Parse genérico: JSON por linha
-    rows = []
-    for i, line in enumerate(logs_text.splitlines(), start=1):
-        s = line.strip()
-        if not s:
-            continue
+    # helper: parse a JSON line safely
+    def _safe_json(line):
         try:
-            obj = json.loads(s)
+            return json.loads(line)
         except Exception:
-            # Linha não é JSON válido → ignora
-            continue
+            return None
+
+    first_obj = None
+    for ln in lines:
+        obj = _safe_json(ln)
+        if isinstance(obj, dict):
+            first_obj = obj
+            break
+
+    if first_obj is None:
+        # Could not parse any line as JSON
+        df_empty = pd.DataFrame(columns=[
+            "timestamp", "user", "page", "__line__", "type", "selected_agent", "model"
+        ])
+        return df_empty, "desconhecido"
+
+    # Heuristic to detect new EMA format (multi-agent)
+    is_new = False
+    if "agents" in first_obj or "agent_name" in first_obj or "agent_id" in first_obj:
+        is_new = True
+    if "log_version" in first_obj and str(first_obj["log_version"]).startswith("ema"):
+        is_new = True
+
+    # ------------------------------------------------------------------
+    # Legacy format → direct normalization
+    # ------------------------------------------------------------------
+    if not is_new:
+        records = []
+        for idx, ln in enumerate(lines, start=1):
+            obj = _safe_json(ln)
+            if not isinstance(obj, dict):
+                continue
+
+            timestamp = obj.get("timestamp")
+            user = obj.get("user") or obj.get("username")
+            page = obj.get("page")
+            _type = obj.get("type")
+            selected_agent = obj.get("selected_agent") or obj.get("agent_name")
+            model = obj.get("model")
+
+            records.append({
+                "timestamp": timestamp,
+                "user": user,
+                "page": page,
+                "__line__": idx,
+                "type": _type,
+                "selected_agent": selected_agent,
+                "model": model,
+            })
+
+        df = pd.DataFrame.from_records(records)
+        # normalize timestamp, but keep tz info if present
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        return df, "legado (antigo EVA)"
+
+    # ------------------------------------------------------------------
+    # New EMA format → convert to legacy schema
+    # ------------------------------------------------------------------
+    records = []
+
+    for idx, ln in enumerate(lines, start=1):
+        obj = _safe_json(ln)
         if not isinstance(obj, dict):
-            obj = {"value": obj}
-        obj.setdefault("__line__", i)
-        rows.append(obj)
+            continue
 
-    if not rows:
-        if debug:
-            st.write("⚠️ Nenhuma linha JSON válida encontrada no log.")
-        cols = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
-        df_empty = pd.DataFrame(columns=cols)
-        df_empty.attrs["log_format"] = "unknown"
-        df_empty.attrs["conversion_applied"] = False
-        return df_empty
+        timestamp = obj.get("timestamp")
+        user = obj.get("user") or obj.get("username")
+        page = obj.get("page") or obj.get("context")  # adjust if needed
+        _type = obj.get("type")
 
-    df_raw = pd.DataFrame(rows)
-    expected = ["timestamp", "user", "page", "message", "__line__", "type", "selected_agent", "model"]
+        # EMA often nests agent info; adapt to your log structure:
+        # ex.: {"selected_agent": {"name": "...", "id": "...", "model": "..."}}
+        selected_agent = None
+        model = None
 
-    # 2) Detecta formato
-    is_legacy = set(expected).issubset(df_raw.columns)
-
-    if debug:
-        st.markdown("### 🔎 Detecção de formato de log")
-        st.write("Colunas brutas:", list(df_raw.columns))
-        if is_legacy:
-            st.success("Formato detectado: **legado (antigo EVA)**. Nenhuma conversão de formato será aplicada.")
+        if isinstance(obj.get("selected_agent"), dict):
+            sel = obj["selected_agent"]
+            selected_agent = sel.get("name") or sel.get("agent_name")
+            model = sel.get("model")
         else:
-            st.warning("Formato detectado: **novo/EMA**. Será aplicada conversão para o formato legado.")
+            selected_agent = obj.get("selected_agent") or obj.get("agent_name")
+            model = obj.get("model")
 
-    # 3) Caso trivial: já está no formato legado
-    if is_legacy:
-        df = df_raw.copy()
-    else:
-        # 4) Formato "novo"/EMA → heurística de colunas
-        if debug:
-            st.write("♻️ Convertendo logs EMA para formato legado (heurística de colunas)...")
+        records.append({
+            "timestamp": timestamp,
+            "user": user,
+            "page": page,
+            "__line__": idx,
+            "type": _type,
+            "selected_agent": selected_agent,
+            "model": model,
+        })
 
-        df = df_raw.copy()
+    df = pd.DataFrame.from_records(records)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-        ts_col    = _find_column_by_substring(df, ["timestamp", "time", "created_at"])
-        user_col  = _find_column_by_substring(df, ["user", "email", "actor"])
-        page_col  = _find_column_by_substring(df, ["page", "screen", "context"])
-        msg_col   = _find_column_by_substring(df, ["message", "content", "text"])
-        type_col  = _find_column_by_substring(df, ["type", "event_type", "kind"])
-        agent_col = _find_column_by_substring(df, ["selected_agent", "agent", "assistant", "bot"])
-        model_col = _find_column_by_substring(df, ["model", "llm_model"])
-
-        if debug:
-            st.markdown("#### Mapeamento de colunas inferido")
-            st.write(f"  timestamp      ← {ts_col}")
-            st.write(f"  user           ← {user_col}")
-            st.write(f"  page           ← {page_col}")
-            st.write(f"  message        ← {msg_col}")
-            st.write(f"  type           ← {type_col}")
-            st.write(f"  selected_agent ← {agent_col}")
-            st.write(f"  model          ← {model_col}")
-
-        df_norm = pd.DataFrame()
-        df_norm["timestamp"]      = df[ts_col]    if ts_col    else np.nan
-        df_norm["user"]           = df[user_col]  if user_col  else np.nan
-        df_norm["page"]           = df[page_col]  if page_col  else "chat"
-        df_norm["message"]        = df[msg_col]   if msg_col   else ""
-        df_norm["__line__"]       = df["__line__"] if "__line__" in df.columns else pd.Series(range(1, len(df) + 1))
-        df_norm["type"]           = df[type_col]  if type_col  else np.nan
-        df_norm["selected_agent"] = df[agent_col] if agent_col else np.nan
-        df_norm["model"]          = df[model_col] if model_col else np.nan
-
-        df = df_norm
-
-    # 5) Garante todas as colunas esperadas
-    for c in expected:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # 6) Normalizações de tipo / formatação
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df["user"] = df["user"].astype(str).str.strip().str.lower()
-    df["page"] = df["page"].astype(str).str.strip().str.lower()
-    df["selected_agent"] = df["selected_agent"].astype(str).str.strip()
-    df["model"] = df["model"].astype(str).str.strip()
-
-    # 7) Anotar metadados sobre o formato
-    df.attrs["log_format"] = "legacy" if is_legacy else "ema"
-    df.attrs["conversion_applied"] = (not is_legacy)
-
-    if debug:
-        st.markdown("#### ✅ DataFrame normalizado (formato legado)")
-        st.dataframe(df.head())
-
-    return df
+    return df, "novo EMA (convertido para legado)"
 
 def _log_normalize(s: pd.Series) -> pd.Series:
     """Log-normalize a positive series to [0, 1]."""
