@@ -54,7 +54,7 @@ elif opcao == "Atualizar Scores (Logs)":
         # 2) Converter texto → DataFrame legado normalizado
         st.info("🔄 Convertendo e normalizando logs para formato legado…")
 
-        # --- NOVO TRECHO: trata retorno como df OU (df, meta) ---
+        # --- Trata retorno como df OU (df, meta) ---
         res = convert_logs_text_to_normalized_df(logs_text, debug=debug)
         meta = {}
 
@@ -71,7 +71,6 @@ elif opcao == "Atualizar Scores (Logs)":
         # Campos de formato / conversão, com defaults seguros
         log_fmt = meta.get("log_format", "unknown")
         conv = bool(meta.get("conversion_applied", False))
-        # --------------------------------------------------------
 
         # ---------- Seção de debug sobre formato dos logs ----------
         if debug:
@@ -100,7 +99,8 @@ elif opcao == "Atualizar Scores (Logs)":
             # Evita erro de timezone/offset no st.dataframe:
             df_dbg = df_raw.copy()
             if "timestamp" in df_dbg.columns:
-                df_dbg["timestamp"] = df_dbg["timestamp"].astype(str)
+                # 👇 alteração: usar map(str) em vez de astype(str)
+                df_dbg["timestamp"] = df_dbg["timestamp"].map(str)
 
             st.markdown("#### DataFrame bruto normalizado (formato legado)")
             st.dataframe(df_dbg.head())
@@ -123,7 +123,8 @@ elif opcao == "Atualizar Scores (Logs)":
             st.markdown("#### DataFrame após filtros")
             df_dbg2 = df_filt.copy()
             if "timestamp" in df_dbg2.columns:
-                df_dbg2["timestamp"] = df_dbg2["timestamp"].astype(str)
+                # 👇 mesma correção aqui
+                df_dbg2["timestamp"] = df_dbg2["timestamp"].map(str)
             st.dataframe(df_dbg2.head())
 
         if df_filt.empty:
@@ -150,7 +151,7 @@ elif opcao == "Atualizar Scores (Logs)":
             st.markdown("#### Scores calculados")
             st.dataframe(df_scores)
 
-        # 5) Obter manager (já configurado em outras partes do app)
+        # 5) Obter manager
         mgr = (
             st.session_state.get("multi_agent_manager")
             or st.session_state.get("agent_manager")
@@ -188,15 +189,12 @@ elif opcao == "Atualizar Scores (Logs)":
                 old_score = float(item.get("score", 0.0) or 0.0)
 
                 if name_norm in score_map:
-                    # Score vindo dos logs
                     new_score = float(score_map[name_norm])
                     status = "updated_from_logs"
                 else:
-                    # Penalização para agentes que NÃO apareceram nos logs
                     new_score = old_score / 10.0
                     status = "decayed_no_logs"
 
-                # Se não mudou, não conta
                 if abs(new_score - old_score) < 1e-9:
                     continue
 
