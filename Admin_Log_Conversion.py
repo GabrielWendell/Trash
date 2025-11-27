@@ -53,13 +53,28 @@ elif opcao == "Atualizar Scores (Logs)":
 
         # 2) Converter texto → DataFrame legado normalizado
         st.info("🔄 Convertendo e normalizando logs para formato legado…")
-        df_raw = convert_logs_text_to_normalized_df(logs_text, debug=debug)
+
+        # --- NOVO TRECHO: trata retorno como df OU (df, meta) ---
+        res = convert_logs_text_to_normalized_df(logs_text, debug=debug)
+        meta = {}
+
+        if isinstance(res, tuple):
+            # Helper retornou (df, meta_dict)
+            df_raw, meta = res
+            if not isinstance(meta, dict):
+                meta = {}
+        else:
+            # Helper retornou apenas o DataFrame
+            df_raw = res
+            if hasattr(df_raw, "attrs"):
+                meta = df_raw.attrs
+        # Campos de formato / conversão, com defaults seguros
+        log_fmt = meta.get("log_format", "unknown")
+        conv = bool(meta.get("conversion_applied", False))
+        # --------------------------------------------------------
 
         # ---------- Seção de debug sobre formato dos logs ----------
         if debug:
-            log_fmt = df_raw.attrs.get("log_format", "unknown")
-            conv = bool(df_raw.attrs.get("conversion_applied", False))
-
             st.markdown("### 📄 Resumo do formato de log utilizado")
 
             if log_fmt == "legacy":
@@ -89,8 +104,9 @@ elif opcao == "Atualizar Scores (Logs)":
 
             st.markdown("#### DataFrame bruto normalizado (formato legado)")
             st.dataframe(df_dbg.head())
-            st.write("value_counts(page):")
-            st.write(df_raw["page"].value_counts(dropna=False))
+            if "page" in df_raw.columns:
+                st.write("value_counts(page):")
+                st.write(df_raw["page"].value_counts(dropna=False))
 
         # 3) Filtros de política
         st.info("🧹 Aplicando filtros de política…")
